@@ -14,9 +14,8 @@
 # Run: docker compose up -d
 # ============================================================================
 
-version: '3.8'
-
 services:
+  # ── BACKEND: Hermes Agent ──
   hermes:
     image: nousresearch/hermes-agent:latest
     container_name: custodian-hermes-demo
@@ -37,7 +36,7 @@ services:
       - "8642:8642"
 
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8642/v1/health"]
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8642/v1/health')\""]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -49,6 +48,7 @@ services:
           memory: 2G
           cpus: '2'
 
+  # ── FRONTEND: Open WebUI ──
   openwebui:
     image: ghcr.io/open-webui/open-webui:main
     container_name: custodian-webui-demo

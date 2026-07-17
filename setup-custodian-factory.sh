@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================================
-# Custodian Factory Setup - Single-Client Demo
+# Custodian Factory Setup — Single-Client Demo
 # ============================================================================
 #
 # What this does:
@@ -13,17 +13,24 @@
 #   3. Open WebUI image (ghcr.io/open-webui/open-webui:main)
 #
 # Ports it opens:
-#   8642 - Hermes Agent API (OpenAI-compatible)
-#   3000 - Open WebUI chat interface (browser)
+#   8642 — Hermes Agent API (OpenAI-compatible)
+#   3000 — Open WebUI chat interface (browser)
 #
 # Prerequisites:
-#   - Ubuntu 22.04 LTS or 24.04 LTS (bare install)
-#   - Root access
+#   - Ubuntu 22.04 LTS or 24.04 LTS (bare install, no existing Docker)
+#   - Root access (script runs as root)
 #   - Internet access
 #   - 6GB+ RAM, 4+ CPU cores, 40GB+ disk
 #
 # How to run:
-#   curl -s https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/setup-custodian-factory.sh | bash
+#   One-liner (installs everything):
+#     curl -s https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/setup-custodian-factory.sh | bash
+#
+#   Skip specific components with environment variables:
+#     curl -s URL | SKIP_DOCKER=1 bash     # Skip Docker install
+#     curl -s URL | SKIP_HERMES=1 bash     # Skip Hermes pull
+#     curl -s URL | SKIP_OWUI=1 bash       # Skip Open WebUI deploy
+#     curl -s URL | SKIP_DOCKER=1 SKIP_HERMES=1 bash  # Skip multiple
 #
 # Architecture sources:
 #   - Docker install: https://docs.docker.com/engine/install/ubuntu/
@@ -47,6 +54,7 @@ log_ok()    { echo -e "  ${GREEN}OK:${NC} $1"; }
 log_warn()  { echo -e "  ${YELLOW}WARN:${NC} $1"; }
 log_error() { echo -e "  ${RED}ERROR:${NC} $1"; }
 log_info()  { echo -e "  -> $1"; }
+log_skip()  { echo -e "  ${YELLOW}SKIP:${NC} $1 (env var set)"; }
 
 if [ "$(id -u)" -ne 0 ]; then
     log_error "Must run as root"
@@ -58,8 +66,10 @@ OS_VER=$(grep -oP 'VERSION_ID="?\K[0-9.]+' /etc/os-release)
 COMPOSE_URL="https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/docker-compose.custodian-factory.yml"
 
 echo -e "${GREEN}"
-echo "  Custodian Factory - Single-Client Demo Setup"
+echo "  Custodian Factory — Single-Client Demo Setup"
 echo "  OS: $OS_ID $OS_VER | Host: $(hostname) | $(date)"
+echo "  Non-interactive mode — all components install automatically"
+echo "  Use SKIP_DOCKER=1 / SKIP_HERMES=1 / SKIP_OWUI=1 to skip steps"
 echo -e "${NC}"
 
 # ============================================================
@@ -75,17 +85,20 @@ timedatectl | grep -E "Time zone|NTP service|synchronized"
 log_ok "Timezone: $(timedatectl show -p Timezone --value)"
 
 # ============================================================
-# STEP 1: System Update
+# STEP 1: System Update & Prerequisites
 # ============================================================
-log_step "Step 1: System Update"
+log_step "Step 1: System Update & Prerequisites"
 export DEBIAN_FRONTEND=noninteractive
 apt update -qq && apt upgrade -y -qq
-log_ok "System updated"
+apt-get install -y -qq ca-certificates curl openssl
+log_ok "System updated; prerequisites installed (ca-certificates, curl, openssl)"
 
 # ============================================================
 # STEP 2: Firewall Off (demo/testing CT on internal LAN)
+# Behind router firewall. Production would use proper iptables/ufw rules.
 # ============================================================
 log_step "Step 2: Firewall"
+log_warn "Demo/testing mode — disabling firewall (behind LAN router)"
 ufw disable 2>/dev/null || true
 iptables -P INPUT ACCEPT && iptables -P FORWARD ACCEPT && iptables -P OUTPUT ACCEPT && iptables -F
 log_ok "All ports open (internal LAN demo)"
@@ -95,114 +108,131 @@ log_ok "All ports open (internal LAN demo)"
 # Source: https://docs.docker.com/engine/install/ubuntu/
 # Exact commands from official docs. No guessing.
 # Works on Ubuntu 22.04 AND 24.04 (same repo structure).
+# Skip with: SKIP_DOCKER=1
 # ============================================================
 log_step "Step 3: Docker Installation"
-read -p "  Install Docker Engine? (y/n): " -n 1 -r DO_DOCKER
-echo
-if [[ ! $DO_DOCKER =~ ^[Yy]$ ]]; then
-    log_warn "Docker SKIPPED. Run 'curl -fsSL https://get.docker.com | sh' later."
-    exit 0
+
+if [ "${SKIP_DOCKER:-0}" = "1" ]; then
+    log_skip "Docker installation (SKIP_DOCKER=1)"
+else
+    # Remove old packages (safe on fresh install)
+    log_info "Removing old Docker packages (if any)..."
+    for pkg in docker.io docker-doc docker-compose podman-docker containerd runc; do
+        apt-get remove -y $pkg 2>/dev/null || true
+    done
+
+    # Docker's official GPG key
+    log_info "Adding Docker's official GPG key..."
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+    chmod a+r /etc/apt/keyrings/docker.asc
+
+    # Docker apt repository
+    log_info "Adding Docker apt repository..."
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list
+
+    # Install Docker Engine + Compose plugin
+    log_info "Installing Docker Engine + Compose plugin..."
+    apt-get update -qq
+    apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+    # Start Docker
+    systemctl enable --now docker
+    log_ok "Docker: $(docker --version)"
+    log_ok "Compose: $(docker compose version 2>/dev/null || echo 'OK')"
 fi
-
-# Remove old packages (safe on fresh install)
-for pkg in docker.io docker-doc docker-compose podman-docker containerd runc; do
-    apt-get remove -y $pkg 2>/dev/null || true
-done
-
-# Prerequisites
-apt-get install -y -qq ca-certificates curl
-
-# Docker's official GPG key
-install -m 0755 -d /etc/apt/keyrings
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-chmod a+r /etc/apt/keyrings/docker.asc
-
-# Docker apt repository
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list
-
-# Install Docker Engine + Compose plugin
-apt-get update -qq
-apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-
-# Start Docker
-systemctl enable --now docker
-log_ok "Docker: $(docker --version)"
-log_ok "Compose: $(docker compose version 2>/dev/null || echo 'OK')"
 
 # ============================================================
 # STEP 4: Pull Hermes Agent Image
 # Source: https://hermes-agent.nousresearch.com/docs/user-guide/docker
+# Image: nousresearch/hermes-agent:latest (Docker Hub, public)
+# Skip with: SKIP_HERMES=1
 # ============================================================
 log_step "Step 4: Hermes Agent Image"
-read -p "  Pull Hermes Agent image? (y/n): " -n 1 -r DO_HERMES
-echo
-if [[ ! $DO_HERMES =~ ^[Yy]$ ]]; then
-    log_warn "Hermes pull SKIPPED"
+
+if [ "${SKIP_HERMES:-0}" = "1" ]; then
+    log_skip "Hermes Agent pull (SKIP_HERMES=1)"
 else
+    log_info "Pulling nousresearch/hermes-agent:latest..."
     docker pull nousresearch/hermes-agent:latest
-    log_ok "Hermes image pulled"
+    log_ok "Hermes Agent image pulled"
+    docker images | grep hermes-agent
 fi
 
 # ============================================================
 # STEP 5: Open WebUI + Docker Compose Setup
 # Source: features/hermes-openwebui-docker-architecture.md
+# Uses the docker-compose.custodian-factory.yml from the same repo.
+# Skip with: SKIP_OWUI=1
 # ============================================================
 log_step "Step 5: Open WebUI + Compose Setup"
-read -p "  Set up Open WebUI with docker-compose? (y/n): " -n 1 -r DO_OWUI
-echo
-if [[ ! $DO_OWUI =~ ^[Yy]$ ]]; then
-    log_warn "Open WebUI SKIPPED"
-    exit 0
-fi
 
-# Generate secure random keys (NEVER hardcoded)
-API_SERVER_KEY=$(openssl rand -hex 32)
-WEBUI_SECRET_KEY=$(openssl rand -hex 32)
-log_info "Generated API_SERVER_KEY: ${API_SERVER_KEY:0:16}..."
-log_info "Generated WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY:0:16}..."
+if [ "${SKIP_OWUI:-0}" = "1" ]; then
+    log_skip "Open WebUI deploy (SKIP_OWUI=1)"
+else
+    # Generate secure random keys (NEVER hardcoded)
+    API_SERVER_KEY=$(openssl rand -hex 32)
+    WEBUI_SECRET_KEY=$(openssl rand -hex 32)
+    log_info "Generated API_SERVER_KEY: ${API_SERVER_KEY:0:16}..."
+    log_info "Generated WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY:0:16}..."
 
-# Create data directories
-mkdir -p ./hermes-data ./webui-data
+    # Create data directories
+    mkdir -p ./hermes-data ./webui-data
 
-# Download compose file if not present
-if [ ! -f "docker-compose.custodian-factory.yml" ]; then
-    curl -sS -o docker-compose.custodian-factory.yml "$COMPOSE_URL"
-    log_ok "Compose file downloaded"
-fi
+    # Download compose file if not present
+    if [ ! -f "docker-compose.custodian-factory.yml" ]; then
+        log_info "Downloading docker-compose.custodian-factory.yml..."
+        curl -sS -o docker-compose.custodian-factory.yml "$COMPOSE_URL"
+        log_ok "Compose file downloaded"
+    else
+        log_info "Using existing docker-compose.custodian-factory.yml"
+    fi
 
-# Deploy
-API_SERVER_KEY="$API_SERVER_KEY" WEBUI_SECRET_KEY="$WEBUI_SECRET_KEY" docker compose -f docker-compose.custodian-factory.yml up -d
+    # Deploy with docker compose
+    log_info "Starting Custodian stack..."
+    API_SERVER_KEY="$API_SERVER_KEY" WEBUI_SECRET_KEY="$WEBUI_SECRET_KEY" \
+      docker compose -f docker-compose.custodian-factory.yml up -d
 
-# Save keys
-cat > .env.custodian-factory << KEYEOF
+    # Save keys to .env file for reference
+    cat > .env.custodian-factory << KEYEOF
 # Generated by setup-custodian-factory.sh on $(date)
+# Keep this file secure. Do not commit to version control.
 API_SERVER_KEY=$API_SERVER_KEY
 WEBUI_SECRET_KEY=$WEBUI_SECRET_KEY
 KEYEOF
-chmod 600 .env.custodian-factory
-log_ok "Keys saved to .env.custodian-factory"
+    chmod 600 .env.custodian-factory
+    log_ok "Keys saved to .env.custodian-factory (permissions: 600)"
+fi
 
 # ============================================================
-# STEP 6: Verification
+# STEP 6: Final Verification
+# Source: features/hermes-openwebui-docker-architecture.md § Verification
 # ============================================================
-log_step "Step 6: Verification"
-echo "  Waiting for containers to start (30s)..."
-sleep 15
+log_step "Step 6: Final Verification"
 
-docker compose -f docker-compose.custodian-factory.yml ps
+log_info "Waiting for containers to initialize (this may take 30-60 seconds)..."
+sleep 10
 
+# Container status
+log_info "Container status:"
+docker compose -f docker-compose.custodian-factory.yml ps 2>/dev/null || log_warn "docker compose ps failed (containers may still be starting)"
+
+# Hermes health check
+log_info "Checking Hermes Agent health..."
 HERMES_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8642/v1/health 2>/dev/null || echo "000")
 if [ "$HERMES_CODE" = "200" ]; then
     log_ok "Hermes Agent: healthy (HTTP 200)"
 else
-    log_warn "Hermes Agent: HTTP $HERMES_CODE (may still be starting)"
+    log_warn "Hermes Agent: HTTP $HERMES_CODE (may still be starting — check: docker logs custodian-hermes-demo)"
 fi
 
+# Open WebUI check
+log_info "Checking Open WebUI..."
 OWUI_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000 2>/dev/null || echo "000")
 if [ "$OWUI_CODE" = "200" ] || [ "$OWUI_CODE" = "302" ]; then
     log_ok "Open WebUI: reachable (HTTP $OWUI_CODE)"
 else
-    log_warn "Open WebUI: HTTP $OWUI_CODE (may still be starting)"
+    log_warn "Open WebUI: HTTP $OWUI_CODE (may still be starting — check: docker logs custodian-webui-demo)"
 fi
 
 # ============================================================
@@ -211,7 +241,7 @@ fi
 SERVER_IP=$(hostname -I | awk '{print $1}')
 echo ""
 echo -e "${GREEN}=============================================${NC}"
-echo -e "${GREEN}  CUSTODIAN FACTORY - SETUP COMPLETE${NC}"
+echo -e "${GREEN}  CUSTODIAN FACTORY — SETUP COMPLETE${NC}"
 echo -e "${GREEN}=============================================${NC}"
 echo ""
 echo "  Open WebUI:  http://${SERVER_IP}:3000"
