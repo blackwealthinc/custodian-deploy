@@ -1,0 +1,77 @@
+# ============================================================================
+# Custodian Factory — Docker Compose
+# Hermes Agent (backend) + Open WebUI (frontend) for single-client demo
+#
+# Repository: https://github.com/blackwealthinc/custodian-deploy
+# Architecture doc: features/hermes-openwebui-docker-architecture.md
+# Timezone doc: features/timezone-ntp-configuration.md
+#
+# Ports:
+#   Hermes API:   8642 (OpenAI-compatible endpoint)
+#   Open WebUI:   3000 (browser chat interface)
+#
+# Prerequisites: Docker Engine + Docker Compose plugin installed
+# Run: docker compose up -d
+# ============================================================================
+
+version: '3.8'
+
+services:
+  hermes:
+    image: nousresearch/hermes-agent:latest
+    container_name: custodian-hermes-demo
+    restart: unless-stopped
+
+    environment:
+      - HERMES_UID=10000
+      - HERMES_GID=10000
+      - API_SERVER_ENABLED=true
+      - API_SERVER_HOST=0.0.0.0
+      - API_SERVER_KEY=${API_SERVER_KEY}
+      - TZ=${TZ:-America/Chicago}
+
+    volumes:
+      - ./hermes-data:/opt/data
+
+    ports:
+      - "8642:8642"
+
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8642/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2'
+
+  openwebui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: custodian-webui-demo
+    restart: unless-stopped
+
+    environment:
+      - OPENAI_API_BASE_URL=http://hermes:8642/v1
+      - OPENAI_API_KEY=${API_SERVER_KEY}
+      - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY}
+      - TZ=${TZ:-America/Chicago}
+
+    volumes:
+      - ./webui-data:/app/backend/data
+
+    ports:
+      - "3000:8080"
+
+    depends_on:
+      hermes:
+        condition: service_healthy
+
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1'
