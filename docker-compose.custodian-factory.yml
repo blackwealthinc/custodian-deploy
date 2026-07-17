@@ -20,6 +20,7 @@ services:
     image: nousresearch/hermes-agent:latest
     container_name: custodian-hermes-demo
     restart: unless-stopped
+    command: ["gateway", "run"]
 
     environment:
       - HERMES_UID=10000
