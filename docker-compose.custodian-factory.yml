@@ -1,24 +1,23 @@
 # ============================================================================
 # Custodian Factory — Docker Compose
-# Hermes Agent (backend) + Open WebUI (frontend) for single-client demo
+# ============================================================================
+# Routes ALL AI requests through the Budget Proxy (LiteLLM).
+# No direct DeepSeek access — proxy handles keys, tokens, billing.
 #
+# Required env vars:
+#   API_SERVER_KEY  — Hermes API auth (required)
+#   WEBUI_SECRET_KEY — Open WebUI secret (required)  
+#   CUSTOMER_API_KEY — Customer virtual key from Budget Proxy (required)
+#   BUDGET_PROXY_URL — Budget Proxy URL (default: https://budget.ns1net.com/v1)
+#
+# Multi-customer: PORT=8601 WEBUI_PORT=3001 CUSTOMER_ID=maria docker compose -p maria up -d
 # Repository: https://github.com/blackwealthinc/custodian-deploy
-# Architecture doc: features/hermes-openwebui-docker-architecture.md
-# Timezone doc: features/timezone-ntp-configuration.md
-#
-# Ports:
-#   Hermes API:   8642 (OpenAI-compatible endpoint)
-#   Open WebUI:   3000 (browser chat interface)
-#
-# Prerequisites: Docker Engine + Docker Compose plugin installed
-# Run: docker compose up -d
 # ============================================================================
 
 services:
-  # ── BACKEND: Hermes Agent ──
   hermes:
     image: nousresearch/hermes-agent:latest
-    container_name: custodian-hermes-demo
+    container_name: ${CUSTOMER_ID:-custodian}-hermes
     restart: unless-stopped
     command: ["gateway", "run"]
 
@@ -28,35 +27,29 @@ services:
       - API_SERVER_ENABLED=true
       - API_SERVER_HOST=0.0.0.0
       - API_SERVER_KEY=${API_SERVER_KEY}
+      - OPENAI_API_KEY=${CUSTOMER_API_KEY}
+      - BUDGET_PROXY_URL=${BUDGET_PROXY_URL:-https://budget.ns1net.com/v1}
       - TZ=${TZ:-America/Chicago}
 
     volumes:
       - ./hermes-data:/opt/data
 
     ports:
-      - "8642:8642"
+      - "${PORT:-8642}:8642"
 
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8642/v1/health')\""]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 60s
+      start_period: 90s
 
-    deploy:
-      resources:
-        limits:
-          memory: 2G
-          cpus: '2'
-
-  # ── FRONTEND: Open WebUI ──
   openwebui:
     image: ghcr.io/open-webui/open-webui:main
-    container_name: custodian-webui-demo
+    container_name: ${CUSTOMER_ID:-custodian}-webui
     restart: unless-stopped
 
-    environment:
-      - OPENAI_API_BASE_URL=http://hermes:8642/v1
+    environment:      - OPENAI_API_BASE_URL=http://hermes:8642/v1
       - OPENAI_API_KEY=${API_SERVER_KEY}
       - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY}
       - TZ=${TZ:-America/Chicago}
@@ -65,14 +58,8 @@ services:
       - ./webui-data:/app/backend/data
 
     ports:
-      - "3000:8080"
+      - "${WEBUI_PORT:-3000}:8080"
 
     depends_on:
       hermes:
         condition: service_healthy
-
-    deploy:
-      resources:
-        limits:
-          memory: 1G
-          cpus: '1'
