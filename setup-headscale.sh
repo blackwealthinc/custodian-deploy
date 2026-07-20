@@ -136,6 +136,12 @@ fi
 
 log_ok "Docker: $(docker --version)"
 
+# Add custodian user to docker group (non-root Docker access)
+if id custodian &>/dev/null; then
+    usermod -aG docker custodian 2>/dev/null || true
+    log_ok "custodian user added to docker group"
+fi
+
 # ============================================================
 # STEP 3: Headscale Deployment
 # ============================================================
@@ -171,6 +177,10 @@ prefixes:
   v6: fd7a:115c:a1e0::/48
   allocation: sequential
 
+# Noise protocol encryption (Headscale v0.23+)
+noise:
+  private_key_path: /var/lib/headscale/noise_private.key
+
 # DERP relay (disabled — direct connections only)
 derp:
   server:
@@ -184,6 +194,14 @@ derp:
 tls_letsencrypt_hostname: ""
 tls_letsencrypt_cache_dir: /var/lib/headscale/cache
 tls_letsencrypt_challenge_type: HTTP-01
+
+# DNS configuration
+dns:
+  override_local_dns: true
+  nameservers:
+    global:
+      - 1.1.1.1
+      - 8.8.8.8
 
 # Database — SQLite (file based, no external DB needed)
 database:
