@@ -19,9 +19,9 @@
 #   DB_PASSWORD           — PostgreSQL password (reads from .db-credentials if not set)
 #
 # One-liner:
-#   DEEPSEEK_API_KEY=*** \
-#   BUDGET_PROXY_DOMAIN=*** \
-#     curl -s https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/setup-budget-proxy.sh | sudo bash
+#   export DEEPSEEK_API_KEY=*** \
+#   export BUDGET_PROXY_DOMAIN=*** && \
+#     curl -s https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/setup-budget-proxy.sh | sudo -E bash
 #
 # Architecture: custodian-architecture-budget-proxy-scaling.md § 2-3
 # Operations:   custodian-operations-guide.md § 1-2
@@ -49,13 +49,13 @@ fi
 # ── Validate Required Input ──
 if [ -z "${DEEPSEEK_API_KEY:-}" ]; then
     log_error "DEEPSEEK_API_KEY is required but not set"
-    echo "  Usage: DEEPSEEK_API_KEY=*** ... | bash"
+    echo "  Usage: export DEEPSEEK_API_KEY=*** && ... | sudo -E bash"
     exit 1
 fi
 
 BUDGET_PROXY_DOMAIN="${BUDGET_PROXY_DOMAIN:-budget.ns1net.com}"
 LITELLM_PORT="${LITELLM_PORT:-443}"
-LITELLM_MASTER_KEY=*** rand -hex 32)
+LITELLM_MASTER_KEY=$(openssl rand -hex 32)
 LITELLM_SALT_KEY=$(openssl rand -hex 32)
 ADMIN_EMAIL="${ADMIN_EMAIL:-admin@custodian.app}"
 

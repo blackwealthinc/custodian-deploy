@@ -17,7 +17,7 @@
 #   HEADSCALE_VERSION  — Docker image tag (default: latest)
 #
 # One-liner:
-#   curl -s https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/setup-headscale.sh | sudo bash
+#   curl -s https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/setup-headscale.sh | sudo -E bash
 #
 # Architecture: custodian-home-lab-setup.md § Phase 1
 # ============================================================================
@@ -222,7 +222,7 @@ docker run -d \
   -v "$HEADSCALE_BASE/config:/etc/headscale:ro" \
   -v "$HEADSCALE_BASE/data:/var/lib/headscale" \
   "headscale/headscale:$HEADSCALE_VERSION" \
-  headscale serve
+  serve
 
 log_ok "Headscale container started"
 
@@ -250,10 +250,10 @@ done
 log_step "Step 5: Create Admin User"
 
 # Check if admin user already exists
-if docker exec headscale headscale users list 2>/dev/null | grep -q 'admin'; then
+if docker exec headscale users list 2>/dev/null | grep -q 'admin'; then
     log_info "Admin user already exists — skipping"
 else
-    docker exec headscale headscale users create admin
+    docker exec headscale users create admin
     log_ok "Admin user created"
 fi
 
@@ -262,7 +262,7 @@ fi
 # ============================================================
 log_step "Step 6: Verify"
 
-USERS=$(docker exec headscale headscale users list 2>/dev/null)
+USERS=$(docker exec headscale users list 2>/dev/null)
 log_info "Users:"
 echo "$USERS" | while read u; do echo "    $u"; done
 
@@ -290,15 +290,15 @@ echo "    # 2. Connect to YOUR Headscale server (not Tailscale's)"
 echo "    tailscale up --login-server http://${SERVER_IP}:${HEADSCALE_PORT}"
 echo ""
 echo "    # 3. The browser will open. Go back to terminal and register:"
-echo "    docker exec headscale headscale nodes list"
-echo "    docker exec headscale headscale nodes register --user admin --key <NODE-KEY>"
+echo "    docker exec headscale nodes list"
+echo "    docker exec headscale nodes register --user admin --key <NODE-KEY>"
 echo ""
 echo "  After all nodes join, they get IPs in 100.64.0.0/10 range."
 echo "  You can SSH between them using those IPs."
 echo ""
 echo "  ── MANAGEMENT COMMANDS ──"
-echo "    docker exec headscale headscale users list"
-echo "    docker exec headscale headscale nodes list"
+echo "    docker exec headscale users list"
+echo "    docker exec headscale nodes list"
 echo "    docker logs -f headscale"
 echo "    docker restart headscale"
 echo ""

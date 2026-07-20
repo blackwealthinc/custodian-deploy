@@ -24,17 +24,16 @@ Always run in this order. Never skip. Never reverse.
 
 ```bash
 # STEP 1 — Database (auto-generates password, no input needed)
-curl -s https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/setup-database.sh | sudo bash
+curl -s https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/setup-database.sh | sudo -E bash
 
 # STEP 2 — Budget Proxy (requires DeepSeek key and domain)
-DEEPSEEK_API_KEY=*** \
-BUDGET_PROXY_DOMAIN=*** \
-  curl -s https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/setup-budget-proxy.sh | sudo bash
+export DEEPSEEK_API_KEY=*** && \
+  curl -s https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/setup-budget-proxy.sh | sudo -E bash
 
 # STEP 3 — Customer Server (requires Budget Proxy URL and customer virtual key)
-CUSTOMER_API_KEY=*** \
-BUDGET_PROXY_URL=https://budget.ns1net.com/v1 \
-  curl -s https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/setup-custodian-factory.sh | sudo bash
+export CUSTOMER_API_KEY=*** \
+export BUDGET_PROXY_URL=https://budget.ns1net.com/v1 && \
+  curl -s https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/setup-custodian-factory.sh | sudo -E bash
 ```
 
 ## Multi-Customer on One Server
