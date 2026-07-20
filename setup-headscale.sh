@@ -94,7 +94,21 @@ if [ -d /dev/lxd ] || [ -d /var/lib/lxc ]; then
 fi
 
 if command -v docker &>/dev/null; then
-    log_ok "Docker already installed: $(docker --version)"
+    # Docker already installed — check if it's LXC-compatible
+    if [ "$IS_LXC" = true ]; then
+        CONTAINERD_VER=$(containerd --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' | head -1 || echo "0.0.0")
+        if dpkg --compare-versions "$CONTAINERD_VER" ge "1.7.28" 2>/dev/null; then
+            log_warn "containerd $CONTAINERD_VER on LXC is broken — switching to docker.io..."
+            apt-get remove -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin 2>/dev/null || true
+            apt-get update -qq
+            apt-get install -y -qq docker.io docker-compose-v2
+            systemctl restart docker
+        else
+            log_ok "Docker already installed (containerd $CONTAINERD_VER, LXC-compatible)"
+        fi
+    else
+        log_ok "Docker already installed: $(docker --version)"
+    fi
 else
     if [ "$IS_LXC" = true ]; then
         # ── Proxmox LXC path: Ubuntu's docker.io package ──

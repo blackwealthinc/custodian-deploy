@@ -44,14 +44,52 @@ apt-get install -y -qq ca-certificates curl openssl
 log_ok 'System updated'
 
 log_step 'Step 2: Docker'
-if ! command -v docker &>/dev/null; then
-  install -m 0755 -d /etc/apt/keyrings
-  curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-  chmod a+r /etc/apt/keyrings/docker.asc
-  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" > /etc/apt/sources.list.d/docker.list
-  apt-get update -qq
-  apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-  systemctl enable --now docker
+
+# ── Auto-detect Proxmox LXC ──
+# docker-ce pulls containerd 1.7.x which triggers
+# "ip_unprivileged_port_start: permission denied" inside LXC.
+# docker.io ships containerd 1.6.x which works in LXC.
+# See: research/proxmox-lxc-containerd-fix-plan.md
+IS_LXC=false
+if [ -f /run/systemd/container ]; then
+    CT_TYPE=$(cat /run/systemd/container 2>/dev/null || echo "")
+    [ "$CT_TYPE" = "lxc" ] || [ "$CT_TYPE" = "lxc-libvirt" ] && IS_LXC=true
+fi
+grep -qa 'lxc' /proc/1/environ 2>/dev/null && IS_LXC=true
+[ -d /dev/lxd ] || [ -d /var/lib/lxc ] && IS_LXC=true
+
+# Install or fix Docker (LXC-aware with containerd version check)
+if command -v docker &>/dev/null; then
+    if [ "$IS_LXC" = true ]; then
+        CONTAINERD_VER=$(containerd --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' | head -1 || echo "0.0.0")
+        if dpkg --compare-versions "$CONTAINERD_VER" ge "1.7.28" 2>/dev/null; then
+            log_warn "containerd $CONTAINERD_VER on LXC is broken — switching to docker.io..."
+            apt-get remove -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin 2>/dev/null || true
+            apt-get update -qq
+            apt-get install -y -qq docker.io docker-compose-v2
+            systemctl restart docker
+        else
+            log_info "Docker already installed (containerd $CONTAINERD_VER, LXC-compatible)"
+        fi
+    else
+        log_info "Docker already installed: $(docker --version)"
+    fi
+else
+    if [ "$IS_LXC" = true ]; then
+        log_warn "Proxmox LXC detected — using docker.io (containerd 1.6.x, LXC-safe)"
+        apt-get remove -y docker.io docker-doc docker-compose podman-docker containerd runc 2>/dev/null || true
+        apt-get update -qq
+        apt-get install -y -qq docker.io docker-compose-v2
+    else
+        log_info "Installing Docker Engine (official repo)..."
+        install -m 0755 -d /etc/apt/keyrings
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+        chmod a+r /etc/apt/keyrings/docker.asc
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" > /etc/apt/sources.list.d/docker.list
+        apt-get update -qq
+        apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    fi
+    systemctl enable --now docker
 fi
 log_ok "Docker: $(docker --version)"
 
