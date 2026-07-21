@@ -181,14 +181,13 @@ prefixes:
 noise:
   private_key_path: /var/lib/headscale/noise_private.key
 
-# DERP relay (disabled — direct connections only)
+# DERP relay — use Tailscale's default DERP map
 derp:
   server:
     enabled: false
-    region_id: 999
-    region_code: "headscale"
-    region_name: "Headscale Embedded DERP"
-    stun_listen_addr: "0.0.0.0:3478"
+  urls:
+    - https://controlplane.tailscale.com/derpmap/default
+  paths: []
 
 # Disable TLS — we use HTTP internally. Add a reverse proxy for HTTPS.
 tls_letsencrypt_hostname: ""
@@ -198,10 +197,12 @@ tls_letsencrypt_challenge_type: HTTP-01
 # DNS configuration
 dns:
   override_local_dns: true
+  magic_dns: true
+  base_domain: ns1net.internal
   nameservers:
     global:
-      - 1.1.1.1
-      - 8.8.8.8
+      - 9.9.9.9
+      - 192.242.2.2
 
 # Database — SQLite (file based, no external DB needed)
 database:
