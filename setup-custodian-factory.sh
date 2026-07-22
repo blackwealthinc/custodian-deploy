@@ -123,7 +123,7 @@ docker exec $HERMES_CONTAINER hermes config set model.provider openai 2>/dev/nul
 docker exec $HERMES_CONTAINER hermes config set model.base_url "${BUDGET_PROXY_URL}" 2>/dev/null || true
 docker exec $HERMES_CONTAINER hermes config set model.default hermes-agent 2>/dev/null || true
 docker exec $HERMES_CONTAINER hermes config unset model.api_key 2>/dev/null || true
-log_ok \"Hermes routing: openai -> ${BUDGET_PROXY_URL}\"
+log_ok "Hermes routing: openai -> ${BUDGET_PROXY_URL}"
 
 log_step 'Step 6: Verify'
 sleep 10
