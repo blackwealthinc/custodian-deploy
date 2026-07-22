@@ -120,7 +120,7 @@ sleep 15
 HERMES_CONTAINER="$CUSTOMER_ID-hermes"
 # Use openai provider to avoid DeepSeek 401 bug
 docker exec $HERMES_CONTAINER hermes config set model.provider openai 2>/dev/null || true
-docker exec $HERMES_CONTAINER hermes config set model.base_url \"${BUDGET_PROXY_URL}\" 2>/dev/null || true
+docker exec $HERMES_CONTAINER hermes config set model.base_url "${BUDGET_PROXY_URL}" 2>/dev/null || true
 docker exec $HERMES_CONTAINER hermes config set model.default hermes-agent 2>/dev/null || true
 docker exec $HERMES_CONTAINER hermes config unset model.api_key 2>/dev/null || true
 log_ok \"Hermes routing: openai -> ${BUDGET_PROXY_URL}\"
