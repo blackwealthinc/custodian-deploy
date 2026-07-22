@@ -100,10 +100,10 @@ log_ok 'Hermes image ready'
 log_step 'Step 4: Deploy Stack'
 [ ! -f docker-compose.custodian-factory.yml ] && curl -sS -o docker-compose.custodian-factory.yml "$COMPOSE_URL"
 
-${CUSTOMER_API_KEY} ${CUSTOMER_API_KEY} \
-  ${BUDGET_PROXY_URL} ${BUDGET_PROXY_URL} \
-  ${API_SERVER_KEY} ${API_SERVER_KEY} \
-  ${WEBUI_SECRET_KEY} ${WEBUI_SECRET_KEY} \
+CUSTOMER_API_KEY="${CUST{OMER_API_KEY}" \
+  BUDGET_PROXY_URL="${BUDGET_PROXY_URL}" \
+  API_SERVER_KEY="${API_SERVER_KEY}" \
+  WEBUI_SECRET_KEY="${WEBU{I_SECRET_KEY}" \
   PORT=$PORT WEBUI_PORT=$WEBUI_PORT CUSTOMER_ID=$CUSTOMER_ID \
   docker compose -p $CUSTOMER_ID -f docker-compose.custodian-factory.yml up -d
 
