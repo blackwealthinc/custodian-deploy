@@ -49,7 +49,8 @@ services:
     container_name: ${CUSTOMER_ID:-custodian}-webui
     restart: unless-stopped
 
-    environment:      - OPENAI_API_BASE_URL=http://hermes:8642/v1
+    environment:
+      - OPENAI_API_BASE_URL=http://hermes:8642/v1
       - OPENAI_API_KEY=${API_SERVER_KEY}
       - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY}
       - TZ=${TZ:-America/Chicago}
