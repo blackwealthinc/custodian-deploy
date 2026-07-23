@@ -145,7 +145,7 @@ HERMES_CONTAINER="$CUSTOMER_ID-hermes"
 docker exec $HERMES_CONTAINER hermes config set model.provider custom 2>/dev/null || true
 docker exec $HERMES_CONTAINER hermes config set model.base_url "${BUDGET_PROXY_URL}" 2>/dev/null || true
 docker exec $HERMES_CONTAINER hermes config set model.default hermes-agent 2>/dev/null || true
-docker exec $HERMES_CONTAINER hermes config unset model.api_key 2>/dev/null || true
+docker exec $HERMES_CONTAINER hermes config set model.api_key "${CUSTOMER_API_KEY}" || true
 log_ok "Hermes routing: custom -> ${BUDGET_PROXY_URL}"
 
 log_step 'Step 6: Verify'
