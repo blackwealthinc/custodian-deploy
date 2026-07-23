@@ -11,6 +11,7 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC
 log_step()  { echo -e "\n${BLUE}=== $1 ===${NC}"; }
 log_ok()    { echo -e "  ${GREEN}OK:${NC} $1"; }
 log_error() { echo -e "  ${RED}ERROR:${NC} $1"; }
+log_warn()  { echo -e "  ${YELLOW}WARN:${NC} $1"; }
 log_info()  { echo -e "  -> $1"; }
 
 [ "$(id -u)" -ne 0 ] && { log_error "Must run as root"; exit 1; }
@@ -29,6 +30,11 @@ WEBUI_PORT="${WEBUI_PORT:-3000}"
 CUSTOMER_ID="${CUSTOMER_ID:-custodian}"
 [ -z "${API_SERVER_KEY:-}" ] && export API_SERVER_KEY=$(openssl rand -hex 32)
 [ -z "${WEBUI_SECRET_KEY:-}" ] && export WEBUI_SECRET_KEY=$(openssl rand -hex 32)
+
+# Hermes version pin -- update when upgrading
+# Find current: docker run --rm nousresearch/hermes-agent:latest hermes --version
+HERMES_PINNED_VERSION="v2026.7.20"
+HERMES_PINNED_DIGEST="sha256:0e06e95613c7536e14f33e9dd5f7c15db676fc25c6c13e350c69ce47e1464033"
 
 SERVER_IP=$(hostname -I | awk '{print $1}')
 COMPOSE_URL="https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/docker-compose.custodian-factory.yml"
@@ -94,8 +100,24 @@ fi
 log_ok "Docker: $(docker --version)"
 
 log_step 'Step 3: Pull Hermes'
-[ "${SKIP_HERMES:-0}" != "1" ] && docker pull nousresearch/hermes-agent:latest
-log_ok 'Hermes image ready'
+HERMES_IMAGE="nousresearch/hermes-agent:${HERMES_PINNED_VERSION}"
+if [ "${SKIP_HERMES:-0}" != "1" ]; then
+  docker pull "$HERMES_IMAGE"
+  ACTUAL_VERSION=$(docker run --rm "$HERMES_IMAGE" hermes --version 2>/dev/null | grep -oP 'v\d+\.\d+\.\d+' | head -1 || echo "unknown")
+  if [ "$ACTUAL_VERSION" != "${HERMES_PINNED_VERSION}" ] && [ "$ACTUAL_VERSION" != "unknown" ]; then
+    echo ""
+    echo "  =============================================="
+    echo "  ${YELLOW}WARNING: HERMES VERSION MISMATCH${NC}"
+    echo "  Expected: ${HERMES_PINNED_VERSION}"
+    echo "  Got:      $ACTUAL_VERSION"
+    echo "  The image tag has been updated."
+    echo "  Update HERMES_PINNED_VERSION in setup-custodian-factory.sh"
+    echo "  and docker-compose.custodian-factory.yml"
+    echo "  =============================================="
+    echo ""
+  fi
+fi
+log_ok "Hermes image ready (pinned: ${HERMES_PINNED_VERSION})" 
 
 log_step 'Step 4: Deploy Stack'
 [ ! -f docker-compose.custodian-factory.yml ] && curl -sS -o docker-compose.custodian-factory.yml "$COMPOSE_URL"
@@ -118,12 +140,13 @@ log_ok 'Keys saved'
 log_step 'Step 5: Configure Hermes Routing'
 sleep 15
 HERMES_CONTAINER="$CUSTOMER_ID-hermes"
-# Use openai provider to avoid DeepSeek 401 bug
-docker exec $HERMES_CONTAINER hermes config set model.provider openai 2>/dev/null || true
+# Use custom provider for OpenAI-compatible endpoints (LiteLLM)
+# Hermes v0.19+ requires "custom"; older versions used "openai"
+docker exec $HERMES_CONTAINER hermes config set model.provider custom 2>/dev/null || true
 docker exec $HERMES_CONTAINER hermes config set model.base_url "${BUDGET_PROXY_URL}" 2>/dev/null || true
 docker exec $HERMES_CONTAINER hermes config set model.default hermes-agent 2>/dev/null || true
 docker exec $HERMES_CONTAINER hermes config unset model.api_key 2>/dev/null || true
-log_ok "Hermes routing: openai -> ${BUDGET_PROXY_URL}"
+log_ok "Hermes routing: custom -> ${BUDGET_PROXY_URL}"
 
 log_step 'Step 6: Verify'
 sleep 10
