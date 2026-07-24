@@ -63,9 +63,6 @@ curl -sS -o docker-compose.gpt-researcher.yml "$COMPOSE_URL"
 log_ok 'Compose file downloaded'
 
 log_step 'Step 5: Deploy GPT Researcher'
-# Ensure it can reach SearXNG on the shared network
-docker network create searxng-net 2>/dev/null || true
-
 # Pass env vars through to compose
 export CUSTOMER_API_KEY BUDGET_PROXY_URL SEARX_URL
 
