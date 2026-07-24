@@ -54,19 +54,36 @@ export DEEPSEEK_API_KEY=*** && \
 - Master key (in `litellm_config.yaml`)
 - Dashboard at `http://100.64.0.1:4000`
 
-**After this runs**, generate a virtual key:
+**After this runs**, generate a virtual key for each customer:
+
 ```bash
-curl -s http://localhost:4000/key/generate \
-  -H "Authorization: Bearer <MASTER_KEY>" \
+# Generate a key (run on VM205 after setup-budget-proxy.sh)
+curl -s -X POST http://localhost:4000/key/generate \
+  -H "Authorization: Bearer *** \
   -H "Content-Type: application/json" \
-  -d '{"key_alias": "admin", "models": ["deepseek-chat", "deepseek-v4-pro"], "max_budget": 100}'
+  -d '{"key_alias": "admin", "models": ["deepseek-chat"], "max_budget": 100, "budget_duration": "1mo"}'
 ```
 
-The response contains a `"key"` field (format: `sk-...`). This is your `CUSTOMER_API_KEY`.
+The response contains `"key": "sk-..."` — this is your `CUSTOMER_API_KEY`.  
+**Create one key per customer.** LiteLLM tracks spend per key automatically at `http://100.64.0.1:4000/ui`.
 
 ---
 
-## STEP 3 — Customer Server (First Customer)
+## STEP 3 — Deep Research (Run ONCE per server, after SearXNG)
+
+GPT Researcher adds autonomous deep research — multi-step web scraping with cited reports.
+
+```bash
+export CUSTOMER_API_KEY=*** && \
+export BUDGET_PROXY_URL=http://100.64.0.1:4000/v1 && \
+  curl -s https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/setup-deep-research.sh | sudo -E bash
+```
+
+**API on port 8000.** Test with: `curl -X POST http://localhost:8000/research -d '{"query":"your topic"}'`
+
+---
+
+## STEP 4 — Customer Server (First Customer)
 
 The default CUSTOMER_ID is `custodian`. Default ports: Hermes 8642, OpenWebUI 3000.
 
@@ -165,6 +182,14 @@ Browser → `http://100.64.0.1:4000`
 curl http://localhost:8888/search?q=test
 ```
 Expected: HTTP 200, 302, or 303 (redirect to results page).
+
+### Manage Customers (LiteLLM Dashboard)
+
+Browser → `http://100.64.0.1:4000/ui`
+- **Keys tab**: See every customer key, spend, budget remaining
+- **Users tab**: Create/delete users, assign to keys
+- **Spend Logs**: Every API call logged with model, tokens, cost
+- **Create a key**: Click "Create Key" → set alias, budget, models → copy the key for the curl command
 
 ---
 
