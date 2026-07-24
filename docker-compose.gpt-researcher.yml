@@ -1,0 +1,70 @@
+# ============================================================================
+# Custodian — GPT Researcher (Deep Research Pipeline)
+# ============================================================================
+# Autonomous deep research agent. Takes a topic, plans sub-questions,
+# scrapes 20+ web sources, synthesizes a cited research report.
+#
+# Connects through Budget Proxy (LiteLLM) for LLM + SearXNG for web search.
+# One instance serves all customers on the same server.
+#
+# Repository: https://github.com/blackwealthinc/custodian-deploy
+# ============================================================================
+
+services:
+  gpt-researcher:
+    image: gptresearcher/gpt-researcher:latest
+    container_name: gpt-researcher
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      # LLM — routed through Budget Proxy (LiteLLM)
+      - OPENAI_API_KEY=${CUSTOMER_API_KEY}
+      - OPENAI_BASE_URL=${BUDGET_PROXY_URL:-http://100.64.0.1:4000/v1}
+
+      # Models — budget proxy only allows deepseek-chat and deepseek-v4-pro
+      - FAST_LLM=openai:deepseek-chat
+      - SMART_LLM=openai:deepseek-chat
+      - STRATEGIC_LLM=openai:deepseek-chat
+
+      # Search — use SearXNG (no Tavily API key needed)
+      - RETRIEVER=searx
+      - SEARX_URL=${SEARX_URL:-http://searxng:8080}
+
+      # Skip Tavily — we use SearXNG
+      - TAVILY_API_KEY=skip
+
+      # Output directories
+      - DOC_PATH=/usr/src/app/my-docs
+      - REPORT_PATH=/usr/src/app/outputs
+
+      # Logging
+      - LOGGING_LEVEL=${LOGGING_LEVEL:-INFO}
+
+      # Optional: temperature
+      - TEMPERATURE=${TEMPERATURE:-0.55}
+
+      # Optional: max research iterations
+      - MAX_ITERATIONS=${MAX_ITERATIONS:-3}
+
+    volumes:
+      - ./gptr-docs:/usr/src/app/my-docs:rw
+      - ./gptr-outputs:/usr/src/app/outputs:rw
+      - ./gptr-logs:/usr/src/app/logs:rw
+
+    user: root
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+    networks:
+      - searxng-net
+
+networks:
+  searxng-net:
+    external: true
+    name: searxng-net
