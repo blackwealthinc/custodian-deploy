@@ -144,9 +144,10 @@ HERMES_CONTAINER="$CUSTOMER_ID-hermes"
 # Hermes v0.19+ requires "custom"; older versions used "openai"
 docker exec $HERMES_CONTAINER hermes config set model.provider custom 2>/dev/null || true
 docker exec $HERMES_CONTAINER hermes config set model.base_url "${BUDGET_PROXY_URL}" 2>/dev/null || true
-docker exec $HERMES_CONTAINER hermes config set model.default hermes-agent 2>/dev/null || true
+docker exec $HERMES_CONTAINER hermes config set model.default deepseek-chat 2>/dev/null || true
+docker exec $HERMES_CONTAINER hermes config set platforms.api_server.extra.model_name "Custodian AI" 2>/dev/null || true
 docker exec $HERMES_CONTAINER hermes config set model.api_key "${CUSTOMER_API_KEY}" || true
-log_ok "Hermes routing: custom -> ${BUDGET_PROXY_URL}"
+log_ok "Hermes routing: deepseek-chat -> ${BUDGET_PROXY_URL} (display: Custodian AI)"
 
 log_step 'Step 6: Verify'
 sleep 10
