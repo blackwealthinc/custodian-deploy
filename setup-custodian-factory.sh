@@ -127,14 +127,14 @@ log_step 'Step 4: Deploy Stack'
   PORT=$PORT WEBUI_PORT=$WEBUI_PORT CUSTOMER_ID=$CUSTOMER_ID \
   docker compose -p $CUSTOMER_ID -f docker-compose.custodian-factory.yml up -d
 
-# Save .env
-cat > .env.custodian-factory << EOF
+# Save .env (namespaced by CUSTOMER_ID — prevents overwrite when adding more customers)
+cat > .env.${CUSTOMER_ID}-factory << EOF
 API_SERVER_KEY=${API_SERVER_KEY}
 WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY}
 CUSTOMER_API_KEY=${CUSTOMER_API_KEY}
 BUDGET_PROXY_URL=${BUDGET_PROXY_URL}
 EOF
-chmod 600 .env.custodian-factory
+chmod 600 .env.${CUSTOMER_ID}-factory
 log_ok 'Keys saved'
 
 log_step 'Step 5: Configure Hermes Routing'
@@ -147,7 +147,9 @@ docker exec $HERMES_CONTAINER hermes config set model.base_url "${BUDGET_PROXY_U
 docker exec $HERMES_CONTAINER hermes config set model.default deepseek-chat 2>/dev/null || true
 docker exec $HERMES_CONTAINER hermes config set platforms.api_server.extra.model_name "Custodian AI" 2>/dev/null || true
 docker exec $HERMES_CONTAINER hermes config set model.api_key "${CUSTOMER_API_KEY}" || true
-log_ok "Hermes routing: deepseek-chat -> ${BUDGET_PROXY_URL} (display: Custodian AI)"
+docker exec $HERMES_CONTAINER hermes config set web.search_backend searxng 2>/dev/null || true
+docker exec $HERMES_CONTAINER hermes config set web.searxng.base_url "http://searxng:8080" 2>/dev/null || true
+log_ok "Hermes routing: deepseek-chat -> ${BUDGET_PROXY_URL} (display: Custodian AI) + SearXNG"
 
 log_step 'Step 6: Verify'
 sleep 10

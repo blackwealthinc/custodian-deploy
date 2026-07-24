@@ -1,0 +1,53 @@
+# ============================================================================
+# Custodian — SearXNG Server (Shared)
+# ============================================================================
+# Private meta-search engine. One per physical server. All customer Hermes
+# instances on this server connect to it at http://searxng:8080 (Docker DNS).
+#
+# Repository: https://github.com/blackwealthinc/custodian-deploy
+# ============================================================================
+
+services:
+  valkey:
+    image: valkey/valkey:8-alpine
+    container_name: searxng-valkey
+    restart: unless-stopped
+    command: valkey-server --save 60 1 --loglevel warning
+    volumes:
+      - ./searxng-valkey-data:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - searxng-net
+
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8888:8080"
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8888/
+      - SEARXNG_REDIS_URL=valkey://searxng-valkey:6379/0
+      - TZ=${TZ:-America/Chicago}
+    volumes:
+      - ./searxng-config:/etc/searxng
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    depends_on:
+      valkey:
+        condition: service_healthy
+    networks:
+      - searxng-net
+
+networks:
+  searxng-net:
+    name: searxng-net
+    driver: bridge
