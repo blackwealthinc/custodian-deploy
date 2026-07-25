@@ -183,14 +183,10 @@ hermes_set model.api_key "${CUSTOMER_API_KEY}" true
 # Display (non-fatal)
 hermes_set platforms.api_server.extra.model_name "Custodian AI"
 
-# SearXNG web search (non-fatal — falls back to DDGS if unavailable)
-if hermes_set web.search_backend searxng && \
-   hermes_set web.searxng.base_url "http://searxng:8080"; then
-  log_ok "SearXNG connected — web search routed through privacy proxy"
-else
-  log_warn "SearXNG not configured — run setup-searxng.sh first on this server"
-  log_warn "Web search will use default backend (may be blocked by search engines)"
-fi
+# SearXNG web search is configured via SEARXNG_URL env var in docker-compose.
+# No hermes config set needed — the web_search tool reads the env var directly.
+# (Bug #11: hermes config set web.search_backend is ignored by the web_search tool)
+log_info "SearXNG: configured via SEARXNG_URL env var in docker-compose"
 
 # Ensure Hermes can reach SearXNG even on existing deployments (network may be missing)
 docker network connect searxng-net "$HERMES_CONTAINER" 2>/dev/null || true

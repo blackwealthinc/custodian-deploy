@@ -30,6 +30,7 @@ services:
       - OPENAI_API_KEY=${CUSTOMER_API_KEY}
       - BUDGET_PROXY_URL=${BUDGET_PROXY_URL:-https://budget.ns1net.com/v1}
       - TZ=${TZ:-America/Chicago}
+      - SEARXNG_URL=http://searxng:8080
 
     volumes:
       - ./hermes-data:/opt/data
