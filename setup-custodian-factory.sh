@@ -154,19 +154,48 @@
 154|154|chmod 600 .env.${CUSTOMER_ID}-factory
 155|155|log_ok 'Keys saved'
 156|156|
-157|157|log_step 'Step 5: Configure Hermes Routing'
-158|158|sleep 15
-159|159|HERMES_CONTAINER="$CUSTOMER_ID-hermes"
-160|160|# Use custom provider for OpenAI-compatible endpoints (LiteLLM)
-161|161|# Hermes v0.19+ requires "custom"; older versions used "openai"
-162|162|docker exec $HERMES_CONTAINER hermes config set model.provider custom 2>/dev/null || true
-163|163|docker exec $HERMES_CONTAINER hermes config set model.base_url "${BUDGET_PROXY_URL}" 2>/dev/null || true
-164|164|docker exec $HERMES_CONTAINER hermes config set model.default deepseek-v4-pro 2>/dev/null || true
-165|165|docker exec $HERMES_CONTAINER hermes config set platforms.api_server.extra.model_name "Custodian AI" 2>/dev/null || true
-166|166|docker exec $HERMES_CONTAINER hermes config set model.api_key "${CUSTOMER_API_KEY}" || true
-167|167|docker exec $HERMES_CONTAINER hermes config set web.search_backend searxng 2>/dev/null || true
-168|168|docker exec $HERMES_CONTAINER hermes config set web.searxng.base_url "http://searxng:8080" 2>/dev/null || true
-169|169|log_ok "Hermes routing: deepseek-chat -> ${BUDGET_PROXY_URL} (display: Custodian AI) + SearXNG"
+log_step 'Step 5: Configure Hermes Routing'
+sleep 15
+HERMES_CONTAINER="$CUSTOMER_ID-hermes"
+
+# Helper: run hermes config, capture errors — never use || true (Bug #8 in deploy catalog)
+hermes_set() {
+  local key="$1" val="$2" fatal="${3:-false}"
+  local err
+  err=$(docker exec "$HERMES_CONTAINER" hermes config set "$key" "$val" 2>&1) || {
+    if [ "$fatal" = "true" ]; then
+      log_error "Hermes config FATAL — $key: $err"
+      exit 1
+    else
+      log_warn "Hermes config — $key: $err"
+    fi
+    return 1
+  }
+  return 0
+}
+
+# Core routing (fatal — AI won't work without these)
+hermes_set model.provider custom true
+hermes_set model.base_url "${BUDGET_PROXY_URL}" true
+hermes_set model.default deepseek-v4-pro true
+hermes_set model.api_key "${CUSTOMER_API_KEY}" true
+
+# Display (non-fatal)
+hermes_set platforms.api_server.extra.model_name "Custodian AI"
+
+# SearXNG web search (non-fatal — falls back to DDGS if unavailable)
+if hermes_set web.search_backend searxng && \
+   hermes_set web.searxng.base_url "http://searxng:8080"; then
+  log_ok "SearXNG connected — web search routed through privacy proxy"
+else
+  log_warn "SearXNG not configured — run setup-searxng.sh first on this server"
+  log_warn "Web search will use default backend (may be blocked by search engines)"
+fi
+
+# Ensure Hermes can reach SearXNG even on existing deployments (network may be missing)
+docker network connect searxng-net "$HERMES_CONTAINER" 2>/dev/null || true
+
+log_ok "Hermes routing: deepseek-v4-pro -> ${BUDGET_PROXY_URL} (display: Custodian AI)"
 170|170|
 171|171|log_step 'Step 6: Verify'
 172|172|sleep 10

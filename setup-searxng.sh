@@ -76,7 +76,7 @@ server:
   secret_key: "CHANGE_ME_USE_OPENSSL_RAND_HEX_32"
   bind_address: "0.0.0.0"
   port: 8080
-  limiter: true
+  limiter: false
   public_instance: false
   image_proxy: true
   method: "GET"
@@ -116,6 +116,9 @@ else
 fi
 
 log_step 'Step 5: Start SearXNG'
+# Ensure the shared network exists (so customer stacks can connect to it)
+docker network create searxng-net 2>/dev/null || true
+
 docker compose -f "$COMPOSE_FILE" down --remove-orphans 2>/dev/null || true
 docker compose -f "$COMPOSE_FILE" up -d
 log_ok 'SearXNG containers started'
