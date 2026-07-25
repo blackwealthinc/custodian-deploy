@@ -45,6 +45,24 @@ PORT="${PORT:-8642}"
 WEBUI_PORT="${WEBUI_PORT:-3000}"
 CUSTOMER_ID="${CUSTOMER_ID:-custodian}"
 MAX_BUDGET="${MAX_BUDGET:-25}"
+
+# Reuse existing API_SERVER_KEY from WebUI database on re-runs (Bug #18 fix)
+# Without this, every re-run generates a new random key → Hermes gets new key
+# but WebUI database still has old key → "No models available"
+if [ -z "${API_SERVER_KEY:-}" ] && [ -f "webui-data/webui.db" ]; then
+  EXISTING_KEY=$(python3 -c "
+import sqlite3, json
+conn = sqlite3.connect('webui-data/webui.db')
+row = conn.execute(\"SELECT value FROM config WHERE key='openai.api_keys'\").fetchone()
+if row:
+    keys = json.loads(row[0])
+    print(keys[0] if keys else '')
+" 2>/dev/null)
+  if [ -n "${EXISTING_KEY}" ]; then
+    export API_SERVER_KEY="${EXISTING_KEY}"
+    log_ok "Reusing existing API_SERVER_KEY from WebUI database"
+  fi
+fi
 [ -z "${API_SERVER_KEY:-}" ] && export API_SERVER_KEY=$(openssl rand -hex 32)
 [ -z "${WEBUI_SECRET_KEY:-}" ] && export WEBUI_SECRET_KEY=$(openssl rand -hex 32)
 
@@ -137,7 +155,8 @@ fi
 log_ok "Hermes image ready (pinned: ${HERMES_PINNED_VERSION})" 
 
 log_step 'Step 4: Deploy Stack'
-[ ! -f docker-compose.custodian-factory.yml ] && curl -sS -o docker-compose.custodian-factory.yml "$COMPOSE_URL"
+# Always download latest compose file — fixes are pushed to GitHub regularly (Bug #18 fix)
+curl -sS -o docker-compose.custodian-factory.yml "$COMPOSE_URL"
 
   BUDGET_PROXY_URL="${BUDGET_PROXY_URL}" \
   API_SERVER_KEY="${API_SERVER_KEY}" \
