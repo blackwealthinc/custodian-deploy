@@ -162,13 +162,13 @@ general_settings:
   disable_spend_logs: false
 
 model_list:
-  - model_name: deepseek-chat
-    litellm_params:
-      model: deepseek/deepseek-chat
-      api_key: ${DEEPSEEK_API_KEY}
   - model_name: deepseek-v4-pro
     litellm_params:
-      model: deepseek/deepseek-chat
+      model: deepseek/deepseek-v4-pro
+      api_key: ${DEEPSEEK_API_KEY}
+  - model_name: deepseek-v4-flash
+    litellm_params:
+      model: deepseek/deepseek-v4-flash
       api_key: ${DEEPSEEK_API_KEY}
 
 litellm_settings:
@@ -253,7 +253,7 @@ ADMIN_KEY_RESPONSE=$(curl -s -X POST http://localhost:4000/key/generate \
     "key_alias": "admin-key",
     "max_budget": 0,
     "budget_duration": "1mo",
-    "models": ["deepseek-chat", "deepseek-v4-pro"],
+    "models": ["deepseek-v4-pro", "deepseek-v4-flash"],
     "metadata": {"user": "admin", "email": "'"${ADMIN_EMAIL}"'"}
   }' 2>/dev/null)
 
@@ -267,29 +267,9 @@ else
 fi
 
 # ============================================================
-# STEP 7: Update database with Budget Proxy server info
+# STEP 7: Verify
 # ============================================================
-log_step "Step 7: Update Database"
-
-if docker ps --format '{{.Names}}' | grep -q 'custodian-postgres'; then
-    docker exec custodian-postgres psql -U "${DB_USER}" -d "${DB_NAME}" -c "
-      UPDATE servers 
-      SET status = 'active',
-          server_name = 'budget-proxy',
-          ip_address = '${SERVER_IP}',
-          spec = 'LiteLLM / PostgreSQL',
-          monthly_cost = 4.40
-      WHERE server_name = 'budget-proxy' OR server_name LIKE 'db-%';
-    " 2>/dev/null || log_warn "Could not update server row"
-    log_ok "Database updated"
-else
-    log_warn "PostgreSQL container not found — skipping database update"
-fi
-
-# ============================================================
-# STEP 8: Verify
-# ============================================================
-log_step "Step 8: Verify"
+log_step "Step 7: Verify"
 
 # Health check
 HEALTH=$(curl -s http://localhost:4000/health 2>/dev/null)

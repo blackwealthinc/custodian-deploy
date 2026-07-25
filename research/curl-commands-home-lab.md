@@ -61,7 +61,7 @@ export DEEPSEEK_API_KEY=*** && \
 curl -s -X POST http://localhost:4000/key/generate \
   -H "Authorization: Bearer *** \
   -H "Content-Type: application/json" \
-  -d '{"key_alias": "admin", "models": ["deepseek-chat"], "max_budget": 100, "budget_duration": "1mo"}'
+  -d '{"key_alias": "admin", "models": ["deepseek-v4-pro"], "max_budget": 100, "budget_duration": "1mo"}'
 ```
 
 The response contains `"key": "sk-..."` — this is your `CUSTOMER_API_KEY`.  
