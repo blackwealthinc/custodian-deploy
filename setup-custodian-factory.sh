@@ -202,13 +202,18 @@ hermes_set model.api_key "${CUSTOMER_API_KEY}" true
 # Display (non-fatal)
 hermes_set platforms.api_server.extra.model_name "Custodian AI"
 
-# SearXNG web search (non-fatal — falls back to DDGS if unavailable)
-if hermes_set web.search_backend searxng && \
-   hermes_set web.searxng.base_url "http://searxng:8080"; then
-  log_ok "SearXNG connected — web search routed through privacy proxy"
+# SearXNG connectivity check — uses DNS, not dead config keys
+# The SEARXNG_URL env var (in compose) is what Hermes actually reads
+if docker exec "$HERMES_CONTAINER" getent hosts searxng >/dev/null 2>&1; then
+  # Verify SearXNG actually responds
+  if docker exec "$HERMES_CONTAINER" curl -s --connect-timeout 3 "http://searxng:8080/search?q=test&format=json" 2>/dev/null | grep -q '"results"'; then
+    log_ok "SearXNG connected — web search active"
+  else
+    log_warn "SearXNG DNS resolves but search failed — check: docker logs searxng"
+  fi
 else
-  log_warn "SearXNG not configured — run setup-searxng.sh first on this server"
-  log_warn "Web search will use default backend (may be blocked by search engines)"
+  log_warn "SearXNG NOT found — run setup-searxng.sh first on this server"
+  log_warn "Web search will not work until SearXNG is deployed"
 fi
 
 # Ensure Hermes can reach SearXNG even on existing deployments (network may be missing)
@@ -217,10 +222,44 @@ docker network connect searxng-net "$HERMES_CONTAINER" 2>/dev/null || true
 log_ok "Hermes routing: deepseek-v4-pro -> ${BUDGET_PROXY_URL} (display: Custodian AI)"
 
 log_step 'Step 6: Verify'
-sleep 10
+
+# 1. Hermes health
 HERMES_CODE=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:${PORT:-8642}/v1/health 2>/dev/null || echo 000)
-OWUI_CODE=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:${WEBUI_PORT:-3000} 2>/dev/null || echo 000)
-echo "  Hermes: HTTP $HERMES_CODE | Open WebUI: HTTP $OWUI_CODE"
+if [ "$HERMES_CODE" = "200" ]; then
+  log_ok "Hermes healthy (HTTP $HERMES_CODE)"
+else
+  log_error "Hermes: HTTP $HERMES_CODE — check: docker logs $HERMES_CONTAINER"
+fi
+
+# 2. WebUI — retry because first startup downloads models (Bug #21)
+log_info "Waiting for WebUI to finish initializing (first start downloads models)..."
+OWUI_CODE=000
+for i in $(seq 1 60); do
+  OWUI_CODE=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:${WEBUI_PORT:-3000} 2>/dev/null || echo 000)
+  [ "$OWUI_CODE" = "200" ] || [ "$OWUI_CODE" = "302" ] && break
+  [ $((i % 6)) -eq 0 ] && log_info "  Still waiting... ($((i*10))s)"
+  sleep 10
+done
+if [ "$OWUI_CODE" = "200" ] || [ "$OWUI_CODE" = "302" ]; then
+  log_ok "WebUI ready (HTTP $OWUI_CODE)"
+else
+  log_warn "WebUI: HTTP $OWUI_CODE — may still be downloading models, refresh in 2-3 min"
+fi
+
+# 3. Budget Proxy — models listing
+MODELS_CODE=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:${PORT:-8642}/v1/models 2>/dev/null || echo 000)
+if [ "$MODELS_CODE" = "200" ]; then
+  log_ok "Budget Proxy reachable — models listed"
+else
+  log_error "Budget Proxy: HTTP $MODELS_CODE — check Budget Proxy on VM205"
+fi
+
+# 4. SearXNG DNS
+if docker exec "$HERMES_CONTAINER" getent hosts searxng >/dev/null 2>&1; then
+  log_ok "SearXNG DNS resolves"
+else
+  log_warn "SearXNG DNS: FAIL — run setup-searxng.sh first"
+fi
 
 echo ''
 echo '=== CUSTODIAN — READY ==='

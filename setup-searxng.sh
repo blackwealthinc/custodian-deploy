@@ -120,17 +120,35 @@ log_step 'Step 5: Start SearXNG'
 docker network create searxng-net 2>/dev/null || true
 
 docker compose -f "$COMPOSE_FILE" down --remove-orphans 2>/dev/null || true
-docker compose -f "$COMPOSE_FILE" up -d
-log_ok 'SearXNG containers started'
+if ! docker compose -f "$COMPOSE_FILE" up -d; then
+  log_error "docker compose up -d failed — check logs: docker compose -f $COMPOSE_FILE logs"
+  exit 1
+fi
 
-log_step 'Step 6: Verify'
-sleep 10
-SEARXNG_CODE=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8888/search?q=test 2>/dev/null || echo 000)
-if [ "$SEARXNG_CODE" = "200" ] || [ "$SEARXNG_CODE" = "302" ] || [ "$SEARXNG_CODE" = "303" ]; then
-    log_ok "SearXNG responding: HTTP $SEARXNG_CODE"
+# Wait for SearXNG health check to pass
+log_info "Waiting for SearXNG to be healthy..."
+for i in $(seq 1 30); do
+  HEALTH=$(docker inspect searxng --format '{{.State.Health.Status}}' 2>/dev/null)
+  [ "$HEALTH" = "healthy" ] && break
+  sleep 2
+done
+if [ "$HEALTH" != "healthy" ]; then
+  log_error "SearXNG health check failed — check: docker logs searxng"
+  exit 1
+fi
+log_ok 'SearXNG healthy'
+
+log_step 'Step 6: Verify Search'
+# Real verification — searches and checks for actual results
+SEARCH_RESULT=$(curl -s "http://localhost:8888/search?q=test&format=json" 2>/dev/null)
+if echo "$SEARCH_RESULT" | grep -q '"results"'; then
+  RESULT_COUNT=$(echo "$SEARCH_RESULT" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('results',[])))" 2>/dev/null || echo "?")
+  log_ok "SearXNG verified — returning $RESULT_COUNT live results"
 else
-    log_warn "SearXNG returned HTTP $SEARXNG_CODE (may need a moment to initialize)"
-    log_info "Check: docker logs searxng"
+  HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8888/search?q=test 2>/dev/null || echo 000)
+  log_error "SearXNG search returned no results (HTTP $HTTP_CODE)"
+  log_error "Check: docker logs searxng"
+  exit 1
 fi
 
 echo ''
