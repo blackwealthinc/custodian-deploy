@@ -116,9 +116,6 @@ else
 fi
 
 log_step 'Step 5: Start SearXNG'
-# Ensure the shared network exists (so customer stacks can connect to it)
-docker network create searxng-net 2>/dev/null || true
-
 docker compose -f "$COMPOSE_FILE" down --remove-orphans 2>/dev/null || true
 if ! docker compose -f "$COMPOSE_FILE" up -d; then
   log_error "docker compose up -d failed — check logs: docker compose -f $COMPOSE_FILE logs"
