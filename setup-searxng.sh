@@ -137,7 +137,7 @@ log_ok 'SearXNG healthy'
 
 log_step 'Step 6: Verify Search'
 # Real verification — searches and checks for actual results
-SEARCH_RESULT=$(curl -s "http://localhost:8888/search?q=test&format=json" 2>/dev/null)
+SEARCH_RESULT=$(curl -s "http://localhost:8888/search?q=test&format=json" 2>/dev/null) || true
 if echo "$SEARCH_RESULT" | grep -q '"results"'; then
   RESULT_COUNT=$(echo "$SEARCH_RESULT" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('results',[])))" 2>/dev/null || echo "?")
   log_ok "SearXNG verified — returning $RESULT_COUNT live results"
