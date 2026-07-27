@@ -16,6 +16,12 @@ log_info()  { echo -e "  -> $1"; }
 
 [ "$(id -u)" -ne 0 ] && { log_error "Must run as root"; exit 1; }
 
+# Ensure we have a real working directory (survives wipes)
+WORKDIR="${CUSTODIAN_HOME:-/home/custodian}"
+mkdir -p "$WORKDIR"
+cd "$WORKDIR"
+log_ok "Working directory: $(pwd)"
+
 # Auto-generate virtual key if not provided (requires LITELLM_MASTER_KEY)
 if [ -z "${CUSTOMER_API_KEY:-}" ]; then
   if [ -z "${LITELLM_MASTER_KEY:-}" ]; then
@@ -81,7 +87,7 @@ log_ok 'Timezone set'
 log_step 'Step 1: System Update'
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq && apt-get upgrade -y -qq
-apt-get install -y -qq ca-certificates curl openssl
+apt-get install -y -qq ca-certificates curl openssl python3
 log_ok 'System updated'
 
 log_step 'Step 2: Docker'

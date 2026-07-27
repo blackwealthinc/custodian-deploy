@@ -24,7 +24,7 @@ SEARXNG_DIR="/opt/searxng"
 log_step 'Step 1: System Update'
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq && apt-get upgrade -y -qq
-apt-get install -y -qq ca-certificates curl
+apt-get install -y -qq ca-certificates curl openssl python3
 log_ok 'System updated'
 
 log_step 'Step 2: Docker'
@@ -125,7 +125,7 @@ fi
 # Wait for SearXNG health check to pass
 log_info "Waiting for SearXNG to be healthy..."
 for i in $(seq 1 30); do
-  HEALTH=$(docker inspect searxng --format '{{.State.Health.Status}}' 2>/dev/null)
+  HEALTH=$(docker inspect searxng --format '{{.State.Health.Status}}' 2>/dev/null) || true
   [ "$HEALTH" = "healthy" ] && break
   sleep 2
 done
