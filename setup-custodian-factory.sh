@@ -227,6 +227,37 @@ docker network connect searxng-net "$HERMES_CONTAINER" 2>/dev/null || true
 
 log_ok "Hermes routing: deepseek-v4-pro -> ${BUDGET_PROXY_URL} (display: Custodian AI)"
 
+log_step 'Step 5b: Enable Web Search in Open WebUI'
+# Open WebUI stores web search config as ConfigVar — env vars work on fresh deploy,
+# but existing DB values take precedence. Ensure they're set either way.
+WEBUI_CONTAINER="$CUSTOMER_ID-webui"
+if docker exec "$WEBUI_CONTAINER" python3 -c "
+import sqlite3
+conn = sqlite3.connect('/app/backend/data/webui.db')
+
+# Config keys used by Open WebUI (from backend/open_webui/config.py)
+configs = [
+    ('web.search.enable', 'true'),
+    ('web.search.engine', 'searxng'),
+    ('web.search.searxng_query_url', 'http://searxng:8080/search?q=<query>'),
+]
+
+for key, val in configs:
+    existing = conn.execute('SELECT value FROM config WHERE key=?', (key,)).fetchone()
+    if existing:
+        conn.execute('UPDATE config SET value=? WHERE key=?', (val, key))
+    else:
+        conn.execute('INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)', (key, val))
+    conn.commit()
+
+conn.close()
+print('OK')
+" 2>/dev/null | grep -q 'OK'; then
+  log_ok "Web search enabled — SearXNG: http://searxng:8080"
+else
+  log_warn "Web search config — WebUI may need to restart before toggle appears"
+fi
+
 log_step 'Step 6: Verify'
 
 # 1. Hermes health

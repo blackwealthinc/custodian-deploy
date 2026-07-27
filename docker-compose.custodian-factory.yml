@@ -31,6 +31,7 @@ services:
       - BUDGET_PROXY_URL=${BUDGET_PROXY_URL:-https://budget.ns1net.com/v1}
       - TZ=${TZ:-America/Chicago}
       - SEARXNG_URL=http://searxng:8080
+      - API_SERVER_MODEL_NAME=Custodian
 
     volumes:
       - ./hermes-data:/opt/data
@@ -59,6 +60,9 @@ services:
       - OPENAI_API_KEY=${API_SERVER_KEY}
       - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY}
       - TZ=${TZ:-America/Chicago}
+      - ENABLE_WEB_SEARCH=true
+      - WEB_SEARCH_ENGINE=searxng
+      - SEARXNG_QUERY_URL=http://searxng:8080/search?q=<query>
 
     volumes:
       - ./webui-data:/app/backend/data
