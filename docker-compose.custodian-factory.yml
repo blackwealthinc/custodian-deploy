@@ -74,6 +74,10 @@ services:
       hermes:
         condition: service_healthy
 
+    networks:
+      - default
+      - searxng-net
+
 networks:
   default:
     driver: bridge

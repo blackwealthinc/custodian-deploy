@@ -3,7 +3,7 @@
 # Routes ALL AI requests through Budget Proxy (LiteLLM)
 #
 # One-liner:
-#   curl -s https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/setup-custodian-factory.sh | sudo bash
+#   export CUSTOMER_API_KEY=*** && curl -s https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/setup-custodian-factory.sh | sudo -E bash
 
 set -euo pipefail
 
@@ -231,31 +231,39 @@ log_step 'Step 5b: Enable Web Search in Open WebUI'
 # Open WebUI stores web search config as ConfigVar — env vars work on fresh deploy,
 # but existing DB values take precedence. Ensure they're set either way.
 WEBUI_CONTAINER="$CUSTOMER_ID-webui"
-if docker exec "$WEBUI_CONTAINER" python3 -c "
-import sqlite3
+
+# Ensure WebUI can reach SearXNG even on existing deployments (network may be missing)
+docker network connect searxng-net "$WEBUI_CONTAINER" 2>/dev/null || true
+
+STEP5B_OUTPUT=$(docker exec "$WEBUI_CONTAINER" python3 -c "
+import sqlite3, json
 conn = sqlite3.connect('/app/backend/data/webui.db')
 
 # Config keys used by Open WebUI (from backend/open_webui/config.py)
+# Values MUST be JSON-encoded — config.value is a SQLAlchemy JSON column
 configs = [
-    ('web.search.enable', 'true'),
-    ('web.search.engine', 'searxng'),
-    ('web.search.searxng_query_url', 'http://searxng:8080/search?q=<query>'),
+    ('web.search.enable', json.dumps(True)),
+    ('web.search.engine', json.dumps('searxng')),
+    ('web.search.searxng_query_url', json.dumps('http://searxng:8080/search?q=<query>')),
 ]
 
-for key, val in configs:
+for key, val_json in configs:
     existing = conn.execute('SELECT value FROM config WHERE key=?', (key,)).fetchone()
     if existing:
-        conn.execute('UPDATE config SET value=? WHERE key=?', (val, key))
+        conn.execute('UPDATE config SET value=? WHERE key=?', (val_json, key))
     else:
-        conn.execute('INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)', (key, val))
+        conn.execute('INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)', (key, val_json))
     conn.commit()
 
 conn.close()
 print('OK')
-" 2>/dev/null | grep -q 'OK'; then
+" 2>&1)
+
+if echo "$STEP5B_OUTPUT" | grep -q 'OK'; then
   log_ok "Web search enabled — SearXNG: http://searxng:8080"
 else
-  log_warn "Web search config — WebUI may need to restart before toggle appears"
+  log_error "Web search config FAILED"
+  log_error "Output: $STEP5B_OUTPUT"
 fi
 
 log_step 'Step 6: Verify'
