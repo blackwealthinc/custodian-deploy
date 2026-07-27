@@ -252,12 +252,13 @@ else
   log_warn "WebUI: HTTP $OWUI_CODE — may still be downloading models, refresh in 2-3 min"
 fi
 
-# 3. Budget Proxy — models listing
+# 3. Budget Proxy — reachability check
+# Note: /v1/models requires auth, so 401 = alive, 000 = dead
 MODELS_CODE=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:${PORT:-8642}/v1/models 2>/dev/null || echo 000)
-if [ "$MODELS_CODE" = "200" ]; then
-  log_ok "Budget Proxy reachable — models listed"
+if [ "$MODELS_CODE" != "000" ]; then
+  log_ok "Budget Proxy reachable (HTTP $MODELS_CODE)"
 else
-  log_error "Budget Proxy: HTTP $MODELS_CODE — check Budget Proxy on VM205"
+  log_error "Budget Proxy: unreachable — check Budget Proxy on VM205"
 fi
 
 # 4. SearXNG DNS
