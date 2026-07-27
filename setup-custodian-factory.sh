@@ -78,7 +78,7 @@ HERMES_PINNED_VERSION="v2026.7.20"
 HERMES_PINNED_DIGEST="sha256:0e06e95613c7536e14f33e9dd5f7c15db676fc25c6c13e350c69ce47e1464033"
 
 SERVER_IP=$(hostname -I | awk '{print $1}')
-COMPOSE_URL="https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/71f412a/docker-compose.custodian-factory.yml"
+COMPOSE_URL="https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/docker-compose.custodian-factory.yml"
 
 log_step 'Step 0: Timezone'
 timedatectl set-timezone America/Chicago 2>/dev/null || true
