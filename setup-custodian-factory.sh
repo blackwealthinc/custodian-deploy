@@ -336,49 +336,16 @@ class Action:
                 "data": {"description": "Researching: " + question[:80] + "...", "done": False}
             })
 
-        research_prompt = f"""You are now in DEEP RESEARCH MODE.
+        research_prompt = f"""DEEP RESEARCH. Search 5-10 authoritative sources about: {question}
 
-PERSONA: You are a senior research analyst. Your job is to produce thorough, well-cited, objective research reports. You are methodical, skeptical of single sources, and committed to accuracy over speed.
+Read each source fully. Cross-reference factual claims across at least 3 independent sources.
 
-TASK: Research the user's question comprehensively. Search the web for authoritative sources. Read every source fully before forming conclusions. Cross-reference every factual claim against at least 3 independent sources. Produce a structured research report.
+Output as a structured report:
+- Key Findings with citations [Source: URL]
+- Conflicting Viewpoints (if sources disagree or evidence is mixed)
+- Sources list with URLs
 
-METHOD:
-1. Start by identifying 2-3 sub-questions that break down the main question
-2. Search for sources on each sub-question using web_search
-3. Extract full content from the most promising URLs using web_extract
-4. Read every extracted source completely before writing anything
-5. Cross-reference claims: if source A and source B disagree, note the disagreement
-6. Only after all sources are read, synthesize your findings
-7. Write the report
-
-OUTPUT FORMAT — Structured report with these sections:
-Executive Summary
-(3-5 sentences summarizing the key findings)
-
-Key Findings
-- Finding 1 with supporting evidence [cite source URL]
-- Finding 2 with supporting evidence [cite source URL]
-- (continue for all major findings)
-
-Conflicting Viewpoints
-(If sources disagree on any claim, explain both sides and which has stronger evidence)
-
-Gaps & Limitations
-(What information was unavailable, what assumptions were made, what needs further research)
-
-Sources
-(numbered list of all sources used, with URLs and brief description of each)
-
-RULES:
-- Do NOT write the report until you have read at least 10 sources
-- Every factual claim MUST have a citation: [Source: URL]
-- If a source is low quality (blog, forum, opinion piece), flag it as such
-- If information is genuinely unavailable, say "Not found in available sources" — do not fabricate
-- Prioritize: official documentation > academic papers > reputable news > industry blogs
-- Never cite a source you haven't fully read
-- If the user's question is vague, narrow it to the most researchable interpretation
-
-THE QUESTION: {question}"""
+Rules: Do not summarize until all sources are read. Cite every claim. Note contradictions. If a source is low quality, flag it. If information is unavailable, say so — do not fabricate."""
 
         messages.append({
             "role": "user",
