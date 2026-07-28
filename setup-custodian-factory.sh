@@ -287,6 +287,148 @@ else
   log_error "Output: $STEP5B_OUTPUT"
 fi
 
+log_step 'Step 5c: Install Deep Research Button'
+
+# Write injection script — single-quoted heredoc (bash interprets NOTHING)
+cat > /tmp/inject_deep_research.py << 'PYEOF'
+import sqlite3, json, uuid, time
+
+conn = sqlite3.connect('/app/backend/data/webui.db')
+
+existing = conn.execute("SELECT id FROM function WHERE name='Deep Research'").fetchone()
+if existing:
+    print('SKIP')
+    conn.close()
+    exit(0)
+
+source = '''"""
+title: Deep Research
+author: Custodian
+description: Multi-source web research with citations. Searches 10+ sources, cross-references claims, and produces a structured report.
+version: 1.0.0
+"""
+from pydantic import BaseModel, Field
+
+class Action:
+    class Valves(BaseModel):
+        priority: int = Field(default=0)
+
+    async def action(self, body: dict, __user__=None, __event_emitter__=None):
+        messages = body.get("messages", [])
+        if not messages:
+            return body
+
+        question = ""
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                question = msg.get("content", "")
+                break
+
+        if not question:
+            return body
+
+        if __event_emitter__:
+            await __event_emitter__({
+                "type": "status",
+                "data": {"description": "Researching: " + question[:80] + "...", "done": False}
+            })
+
+        research_prompt = f"""You are now in DEEP RESEARCH MODE.
+
+PERSONA: You are a senior research analyst. Your job is to produce thorough, well-cited, objective research reports. You are methodical, skeptical of single sources, and committed to accuracy over speed.
+
+TASK: Research the user's question comprehensively. Search the web for authoritative sources. Read every source fully before forming conclusions. Cross-reference every factual claim against at least 3 independent sources. Produce a structured research report.
+
+METHOD:
+1. Start by identifying 2-3 sub-questions that break down the main question
+2. Search for sources on each sub-question using web_search
+3. Extract full content from the most promising URLs using web_extract
+4. Read every extracted source completely before writing anything
+5. Cross-reference claims: if source A and source B disagree, note the disagreement
+6. Only after all sources are read, synthesize your findings
+7. Write the report
+
+OUTPUT FORMAT — Structured report with these sections:
+Executive Summary
+(3-5 sentences summarizing the key findings)
+
+Key Findings
+- Finding 1 with supporting evidence [cite source URL]
+- Finding 2 with supporting evidence [cite source URL]
+- (continue for all major findings)
+
+Conflicting Viewpoints
+(If sources disagree on any claim, explain both sides and which has stronger evidence)
+
+Gaps & Limitations
+(What information was unavailable, what assumptions were made, what needs further research)
+
+Sources
+(numbered list of all sources used, with URLs and brief description of each)
+
+RULES:
+- Do NOT write the report until you have read at least 10 sources
+- Every factual claim MUST have a citation: [Source: URL]
+- If a source is low quality (blog, forum, opinion piece), flag it as such
+- If information is genuinely unavailable, say "Not found in available sources" — do not fabricate
+- Prioritize: official documentation > academic papers > reputable news > industry blogs
+- Never cite a source you haven't fully read
+- If the user's question is vague, narrow it to the most researchable interpretation
+
+THE QUESTION: {question}"""
+
+        messages.append({
+            "role": "user",
+            "content": research_prompt
+        })
+        body["messages"] = messages
+
+        if __event_emitter__:
+            await __event_emitter__({
+                "type": "status",
+                "data": {"description": "Deep Research prompt sent. Searching sources...", "done": True}
+            })
+
+        return body
+'''
+
+meta = json.dumps({
+    "description": "Multi-source web research with citations. Searches 10+ sources, cross-references claims, and produces a structured report.",
+    "manifest": {
+        "name": "Deep Research",
+        "version": "1.0.0"
+    }
+})
+
+valves = json.dumps({})
+now = int(time.time())
+func_id = str(uuid.uuid4())
+
+conn.execute('''INSERT INTO function (id, user_id, name, type, content, meta, valves, is_active, is_global, updated_at, created_at)
+VALUES (?, NULL, ?, 'action', ?, ?, ?, TRUE, TRUE, ?, ?)''',
+    (func_id, 'Deep Research', source, meta, valves, now, now))
+conn.commit()
+conn.close()
+print('OK')
+PYEOF
+
+# Inject into WebUI container
+docker cp /tmp/inject_deep_research.py "$WEBUI_CONTAINER":/tmp/
+STEP5C_OUTPUT=$(docker exec "$WEBUI_CONTAINER" python3 /tmp/inject_deep_research.py 2>&1)
+# Cleanup
+docker exec "$WEBUI_CONTAINER" rm /tmp/inject_deep_research.py 2>/dev/null || true
+rm /tmp/inject_deep_research.py
+
+if echo "$STEP5C_OUTPUT" | grep -q 'OK'; then
+  log_ok "Deep Research button installed — restarting WebUI"
+  docker restart "$WEBUI_CONTAINER" >/dev/null
+elif echo "$STEP5C_OUTPUT" | grep -q 'SKIP'; then
+  log_ok "Deep Research button already installed"
+else
+  log_warn "Deep Research button install failed (non-fatal)"
+  log_warn "Output: $STEP5C_OUTPUT"
+fi
+
 log_step 'Step 6: Verify'
 
 # 1. Hermes health
