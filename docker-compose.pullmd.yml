@@ -1,0 +1,50 @@
+# ============================================================================
+# Custodian — PullMD Web Extraction Engine (Shared)
+# ============================================================================
+# Private URL-to-Markdown service. One per physical server. All Hermes
+# instances on this server connect via MCP at http://pullmd:3000/mcp.
+#
+# Minimal deployment — omits Playwright (3.7 GB) and MarkItDown sidecars.
+# PullMD degrades gracefully: static extraction via Trafilatura + Readability
+# covers >95% of web pages without a headless browser.
+#
+# Deploy with: setup-extractor.sh
+# Repository: https://github.com/blackwealthinc/custodian-deploy
+# ============================================================================
+
+services:
+  trafilatura:
+    image: aeternalabshq/pullmd-trafilatura:latest
+    container_name: pullmd-trafilatura
+    restart: unless-stopped
+    networks:
+      - extractor-net
+
+  pullmd:
+    image: aeternalabshq/pullmd:latest
+    container_name: pullmd
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3001:3000"
+    environment:
+      - TRAFILATURA_URL=http://trafilatura:8001/extract
+      - CACHE_DB=/data/cache.db
+      # Auth disabled — internal-only, not exposed to internet
+      - PULLMD_AUTH_MODE=disabled
+    volumes:
+      - ./data:/data
+    depends_on:
+      - trafilatura
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:3000/api/stats', r => {process.exit(r.statusCode === 200 ? 0 : 1)})\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - extractor-net
+
+networks:
+  extractor-net:
+    name: extractor-net
+    driver: bridge
