@@ -313,6 +313,9 @@ class Action:
     class Valves(BaseModel):
         priority: int = Field(default=0)
 
+    def __init__(self):
+        self.valves = self.Valves()
+
     async def action(self, body: dict, __user__=None, __event_emitter__=None):
         messages = body.get("messages", [])
         if not messages:
