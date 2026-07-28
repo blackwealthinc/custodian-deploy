@@ -164,6 +164,17 @@ log_step 'Step 4: Deploy Stack'
 # Always download latest compose file — fixes are pushed to GitHub regularly (Bug #18 fix)
 curl -sS -o docker-compose.custodian-factory.yml "$COMPOSE_URL"
 
+# Verify prerequisite networks exist (fail fast — Bug #39)
+for net in searxng-net; do
+    if ! docker network inspect "$net" >/dev/null 2>&1; then
+        log_error "$net not found — run the prerequisite scripts first:"
+        log_error "  1. setup-searxng.sh    (creates searxng-net)"
+        log_error "  2. setup-extractor.sh  (creates extractor-net, optional)"
+        exit 3
+    fi
+    log_ok "$net found"
+done
+
   BUDGET_PROXY_URL="${BUDGET_PROXY_URL}" \
   API_SERVER_KEY="${API_SERVER_KEY}" \
   PORT=$PORT WEBUI_PORT=$WEBUI_PORT CUSTOMER_ID=$CUSTOMER_ID \
@@ -224,6 +235,16 @@ fi
 
 # Ensure Hermes can reach SearXNG even on existing deployments (network may be missing)
 docker network connect searxng-net "$HERMES_CONTAINER" 2>/dev/null || true
+
+# Wire Hermes to extractor-net for PullMD web extraction (Bug #38)
+if docker network inspect extractor-net >/dev/null 2>&1; then
+    docker network connect extractor-net "$HERMES_CONTAINER" 2>/dev/null || true
+    docker exec "$HERMES_CONTAINER" hermes config set mcp_servers.pullmd.url http://pullmd:3000/mcp 2>/dev/null || \
+        log_warn "Could not configure PullMD MCP in Hermes (non-fatal)"
+    log_ok "PullMD extraction wired to Hermes"
+else
+    log_warn "extractor-net not found — web extraction unavailable. Run setup-extractor.sh first."
+fi
 
 log_ok "Hermes routing: deepseek-v4-pro -> ${BUDGET_PROXY_URL} (display: Custodian AI)"
 
@@ -305,6 +326,17 @@ if docker exec "$HERMES_CONTAINER" getent hosts searxng >/dev/null 2>&1; then
   log_ok "SearXNG DNS resolves"
 else
   log_warn "SearXNG DNS: FAIL — run setup-searxng.sh first"
+fi
+
+# 5. PullMD extraction (optional)
+if docker network inspect extractor-net >/dev/null 2>&1; then
+  if docker exec "$HERMES_CONTAINER" getent hosts pullmd >/dev/null 2>&1; then
+    log_ok "PullMD extraction available"
+  else
+    log_warn "PullMD DNS: FAIL — check extractor-net connection"
+  fi
+else
+  log_info "PullMD not deployed — web extraction unavailable (optional)"
 fi
 
 echo ''
