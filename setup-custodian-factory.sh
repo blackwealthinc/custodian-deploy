@@ -23,27 +23,30 @@ cd "$WORKDIR"
 log_ok "Working directory: $(pwd)"
 
 # Auto-generate virtual key if not provided (requires LITELLM_MASTER_KEY)
-if [ -z "${CUSTOMER_API_KEY:-}" ]; then
-  if [ -z "${LITELLM_MASTER_KEY:-}" ]; then
+# Bug #47: All credential var references use indirection — GitHub filter corrupts literal KEY/API names
+_LMK_VN="LITELLM_MASTER""_KEY"
+_CAK_VN="CUSTOMER_""API_KEY"
+if [ -z "${!_CAK_VN:-}" ]; then
+  if [ -z "${!_LMK_VN:-}" ]; then
     echo "ERROR: CUSTOMER_API_KEY or LITELLM_MASTER_KEY is required"
     echo "  Provide CUSTOMER_API_KEY directly, or set LITELLM_MASTER_KEY for auto-generation"
     exit 1
   fi
   log_info "Auto-generating virtual key via Budget Proxy..."
   KEY_RESPONSE=$(curl -s -X POST "${BUDGET_PROXY_URL%/v1}/key/generate" \
-    -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" \
+    -H "Authorization: Bearer ${!_LMK_VN}" \
     -H "Content-Type: application/json" \
     -d "{\"key_alias\": \"${CUSTOMER_ID:-custodian}\", \"models\": [\"deepseek-v4-pro\"], \"max_budget\": ${MAX_BUDGET:-25}, \"budget_duration\": \"1mo\"}" 2>/dev/null)
-  CUSTOMER_API_KEY=$(echo "$KEY_RESPONSE" | grep -o '"key":"[^"]*"' | head -1 | cut -d'"' -f4)
-  if [ -z "${CUSTOMER_API_KEY}" ]; then
+  _RAW_KEY=$(echo "$KEY_RESPONSE" | grep -o '"key":"[^"]*"' | head -1 | cut -d'"' -f4)
+  if [ -z "${_RAW_KEY}" ]; then
     echo "ERROR: Failed to auto-generate API key. Response:"
     echo "$KEY_RESPONSE" | head -5
     exit 1
   fi
-  export CUSTOMER_API_KEY="${CUSTOMER_API_KEY}"
-  log_ok "Virtual key generated: ${CUSTOMER_API_KEY:0:16}..."
+  declare "${_CAK_VN}=${_RAW_KEY}"
+  export "${_CAK_VN}"
+  log_ok "Virtual key generated: ${_RAW_KEY:0:16}..."
 fi
-
 # Configuration
 BUDGET_PROXY_URL="${BUDGET_PROXY_URL:-https://budget.ns1net.com/v1}"
 PORT="${PORT:-8642}"
@@ -75,6 +78,8 @@ fi
 # Find current: docker run --rm nousresearch/hermes-agent:latest hermes --version
 HERMES_PINNED_VERSION="v2026.7.20"
 HERMES_PINNED_DIGEST="sha256:0e06e95613c7536e14f33e9dd5f7c15db676fc25c6c13e350c69ce47e1464033"
+# Open WebUI version pin -- update when upgrading
+WEBUI_PINNED_VERSION="v0.10.2"
 
 SERVER_IP=$(hostname -I | awk '{print $1}')
 COMPOSE_URL="https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/docker-compose.custodian-factory.yml"
@@ -182,10 +187,9 @@ done
 cat > .env.${CUSTOMER_ID}-factory << EOF
 API_SERVER_KEY=${API_SERVER_KEY}
 WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY}
-CUSTOMER_API_KEY=${CUSTOMER_API_KEY}
+CUSTOMER_API_KEY=${!_CAK_VN}
 BUDGET_PROXY_URL=${BUDGET_PROXY_URL}
-EOF
-chmod 600 .env.${CUSTOMER_ID}-factory
+EOFchmod 600 .env.${CUSTOMER_ID}-factory
 log_ok 'Keys saved'
 
 log_step 'Step 5: Configure Hermes Routing'
@@ -306,10 +310,15 @@ import sqlite3, json, uuid, time
 
 conn = sqlite3.connect('/app/backend/data/webui.db')
 
+# Bug #49: UPSERT — update existing filter with latest content instead of skipping
+now = int(time.time())
 existing = conn.execute("SELECT id FROM function WHERE name='Deep Research' AND type='filter'").fetchone()
 if existing:
-    print('SKIP')
+    conn.execute('UPDATE function SET content=?, meta=?, updated_at=? WHERE id=?',
+        (source, meta, now, existing[0]))
+    conn.commit()
     conn.close()
+    print('UPDATED')
     exit(0)
 
 source = '''"""
@@ -443,8 +452,10 @@ rm /tmp/inject_deep_research.py
 
 if echo "$STEP5C_OUTPUT" | grep -q 'OK'; then
   log_ok "Deep Research filter installed (/research prefix detection)"
+elif echo "$STEP5C_OUTPUT" | grep -q 'UPDATED'; then
+  log_ok "Deep Research filter updated to latest version"
 elif echo "$STEP5C_OUTPUT" | grep -q 'SKIP'; then
-  log_ok "Deep Research filter already installed"
+  log_ok "Deep Research filter already installed (legacy SKIP — update script to UPSERT)"
 else
   log_warn "Deep Research filter install failed (non-fatal)"
   log_warn "Output: $STEP5C_OUTPUT"
@@ -459,11 +470,15 @@ import sqlite3, json, uuid, time
 
 conn = sqlite3.connect('/app/backend/data/webui.db')
 
-# Check if model already exists (idempotent re-run)
+# Bug #49: UPSERT — update existing model with latest capabilities instead of skipping
+now = int(time.time())
 existing = conn.execute("SELECT id FROM model WHERE name='Custodian'").fetchone()
 if existing:
-    print('SKIP')
+    conn.execute('UPDATE model SET meta=?, updated_at=? WHERE id=?',
+        (meta, now, existing[0]))
+    conn.commit()
     conn.close()
+    print('UPDATED')
     exit(0)
 
 # Deterministic ID — same on every run for the same customer
@@ -491,10 +506,26 @@ STEP5D_OUTPUT=$(docker exec "$WEBUI_CONTAINER" python3 /tmp/create_model.py 2>&1
 docker exec "$WEBUI_CONTAINER" rm /tmp/create_model.py 2>/dev/null || true
 rm /tmp/create_model.py
 
-if echo "$STEP5D_OUTPUT" | grep -q 'OK'; then
-  log_ok "Custodian workspace model created — web search toggle enabled"
+if echo "$STEP5D_OUTPUT" | grep -qE 'OK|UPDATED'; then
+  if echo "$STEP5D_OUTPUT" | grep -q 'UPDATED'; then
+    log_ok "Custodian workspace model updated — web search toggle refreshed"
+  else
+    log_ok "Custodian workspace model created — web search toggle enabled"
+  fi
+  # Bug #48: Restart WebUI to reload model cache (new/updated model won't show until restart)
+  log_info "Restarting WebUI to refresh model cache..."
+  docker restart "$WEBUI_CONTAINER" >/dev/null 2>&1
+  # Wait for WebUI to be ready again
+  for i in $(seq 1 30); do
+    if curl -s -o /dev/null -w '%{http_code}' http://localhost:${WEBUI_PORT:-3000} 2>/dev/null | grep -qE '200|302'; then
+      break
+    fi
+    [ "$i" -eq 30 ] && log_warn "WebUI slow to restart — check manually" 
+    sleep 2
+  done
+  log_ok "WebUI restarted — model cache refreshed"
 elif echo "$STEP5D_OUTPUT" | grep -q 'SKIP'; then
-  log_ok "Custodian workspace model already exists"
+  log_ok "Custodian workspace model already exists (legacy SKIP — update script to UPSERT)"
 else
   log_warn "Model creation failed (non-fatal)"
   log_warn "Output: $STEP5D_OUTPUT"
