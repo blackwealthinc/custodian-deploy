@@ -274,6 +274,7 @@ configs = [
     ('web.search.enable', json.dumps(True)),
     ('web.search.engine', json.dumps('searxng')),
     ('web.search.searxng_query_url', json.dumps('http://searxng:8080/search?q=<query>')),
+    ('web.search.concurrent_requests', json.dumps(0)),
     ('web.search.confirmation.enable', json.dumps(True)),
     ('web.search.confirmation.content', json.dumps('Tip: Type /research before your question for deep research with 10+ sources and citations.')),
 ]
@@ -447,6 +448,56 @@ elif echo "$STEP5C_OUTPUT" | grep -q 'SKIP'; then
 else
   log_warn "Deep Research filter install failed (non-fatal)"
   log_warn "Output: $STEP5C_OUTPUT"
+fi
+
+log_step 'Step 5d: Register Custodian Workspace Model'
+
+# Open WebUI only shows the web search toggle for models with web_search in capabilities.
+# API-fetched models (from Hermes) have no workspace entry — create one (Bug #46).
+cat > /tmp/create_model.py << 'PYEOF'
+import sqlite3, json, uuid, time
+
+conn = sqlite3.connect('/app/backend/data/webui.db')
+
+# Check if model already exists (idempotent re-run)
+existing = conn.execute("SELECT id FROM model WHERE name='Custodian'").fetchone()
+if existing:
+    print('SKIP')
+    conn.close()
+    exit(0)
+
+# Deterministic ID — same on every run for the same customer
+model_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, 'custodian-model'))
+
+meta = json.dumps({
+    "capabilities": {
+        "web_search": True
+    },
+    "description": "Custodian AI — Hermes + DeepSeek via Budget Proxy"
+})
+
+now = int(time.time())
+
+conn.execute('''INSERT INTO model (id, user_id, base_model_id, name, params, meta, is_active, created_at, updated_at)
+VALUES (?, NULL, ?, ?, ?, ?, TRUE, ?, ?)''',
+    (model_id, 'Custodian', 'Custodian', json.dumps({}), meta, now, now))
+conn.commit()
+conn.close()
+print('OK')
+PYEOF
+
+docker cp /tmp/create_model.py "$WEBUI_CONTAINER":/tmp/
+STEP5D_OUTPUT=$(docker exec "$WEBUI_CONTAINER" python3 /tmp/create_model.py 2>&1)
+docker exec "$WEBUI_CONTAINER" rm /tmp/create_model.py 2>/dev/null || true
+rm /tmp/create_model.py
+
+if echo "$STEP5D_OUTPUT" | grep -q 'OK'; then
+  log_ok "Custodian workspace model created — web search toggle enabled"
+elif echo "$STEP5D_OUTPUT" | grep -q 'SKIP'; then
+  log_ok "Custodian workspace model already exists"
+else
+  log_warn "Model creation failed (non-fatal)"
+  log_warn "Output: $STEP5D_OUTPUT"
 fi
 
 log_step 'Step 6: Verify'
