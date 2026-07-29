@@ -3,7 +3,7 @@
 # Routes ALL AI requests through Budget Proxy (LiteLLM)
 #
 # One-liner:
-#   export CUSTOMER_API_KEY=*** && curl -s https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/setup-custodian-factory.sh | sudo -E bash
+#   export CUSTOMER_API_KEY=*** BUDGET_PROXY_URL=https://budget.ns1net.com/v1 && curl -s https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/setup-custodian-factory.sh | sudo -E bash
 
 set -euo pipefail
 
@@ -45,7 +45,6 @@ if [ -z "${CUSTOMER_API_KEY:-}" ]; then
 fi
 
 # Configuration
-CUSTOMER_API_KEY="${CUSTOMER_API_KEY}"
 BUDGET_PROXY_URL="${BUDGET_PROXY_URL:-https://budget.ns1net.com/v1}"
 PORT="${PORT:-8642}"
 WEBUI_PORT="${WEBUI_PORT:-3000}"
@@ -169,7 +168,6 @@ for net in searxng-net; do
     if ! docker network inspect "$net" >/dev/null 2>&1; then
         log_error "$net not found — run the prerequisite scripts first:"
         log_error "  1. setup-searxng.sh    (creates searxng-net)"
-        log_error "  2. setup-extractor.sh  (creates extractor-net, optional)"
         exit 3
     fi
     log_ok "$net found"
@@ -191,8 +189,18 @@ chmod 600 .env.${CUSTOMER_ID}-factory
 log_ok 'Keys saved'
 
 log_step 'Step 5: Configure Hermes Routing'
-sleep 15
+
+# Wait for Hermes API to be ready (Bug #44 — poll, not fixed sleep)
 HERMES_CONTAINER="$CUSTOMER_ID-hermes"
+log_info "Waiting for Hermes API..."
+for i in $(seq 1 30); do
+  if curl -s http://localhost:${PORT:-8642}/v1/health 2>/dev/null | grep -q '"status"'; then
+    break
+  fi
+  [ "$i" -eq 30 ] && { log_error "Hermes API not ready after 60s"; exit 1; }
+  sleep 2
+done
+log_ok "Hermes API ready"
 
 # Helper: run hermes config, capture errors — never use || true (Bug #8 in deploy catalog)
 hermes_set() {
@@ -334,7 +342,7 @@ class Filter:
             return body
 
         content = messages[user_idx].get("content", "")
-        if not content.strip().startswith("/research"):
+        if not content.strip().lower().startswith("/research"):
             return body
 
         question = content.strip()[len("/research"):].strip()
