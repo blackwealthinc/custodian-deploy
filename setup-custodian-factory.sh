@@ -266,6 +266,8 @@ configs = [
     ('web.search.enable', json.dumps(True)),
     ('web.search.engine', json.dumps('searxng')),
     ('web.search.searxng_query_url', json.dumps('http://searxng:8080/search?q=<query>')),
+    ('web.search.confirmation.enable', json.dumps(True)),
+    ('web.search.confirmation.content', json.dumps('Tip: Type /research before your question for deep research with 10+ sources and citations.')),
 ]
 
 for key, val_json in configs:
