@@ -178,7 +178,7 @@ done
   BUDGET_PROXY_URL="${BUDGET_PROXY_URL}" \
   API_SERVER_KEY="${API_SERVER_KEY}" \
   PORT=$PORT WEBUI_PORT=$WEBUI_PORT CUSTOMER_ID=$CUSTOMER_ID \
-  docker compose -p $CUSTOMER_ID -f docker-compose.custodian-factory.yml up -d
+  docker compose -p "${CUSTOMER_ID,,}" -f docker-compose.custodian-factory.yml up -d
 
 # Save .env (namespaced by CUSTOMER_ID — prevents overwrite when adding more customers)
 cat > .env.${CUSTOMER_ID}-factory << EOF
