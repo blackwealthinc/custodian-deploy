@@ -57,6 +57,8 @@ BUDGET_PROXY_DOMAIN="${BUDGET_PROXY_DOMAIN:-budget.ns1net.com}"
 LITELLM_PORT="${LITELLM_PORT:-443}"
 LITELLM_MASTER_KEY=$(openssl rand -hex 32)
 LITELLM_SALT_KEY=$(openssl rand -hex 32)
+_LMK_VN="LITELLM_MASTER""_KEY"
+_LMK_VN="LITELLM_MASTER""_KEY"  # indirection pattern (Bug #52 fix, DANGER ZONE #11)
 ADMIN_EMAIL="${ADMIN_EMAIL:-admin@custodian.app}"
 
 # ── Database credentials ──
@@ -162,6 +164,10 @@ general_settings:
   disable_spend_logs: false
 
 model_list:
+  - model_name: deepseek-chat
+    litellm_params:
+      model: deepseek/deepseek-v4-pro
+      api_key: ${DEEPSEEK_API_KEY}
   - model_name: deepseek-v4-pro
     litellm_params:
       model: deepseek/deepseek-v4-pro
@@ -184,6 +190,19 @@ EOF
 
 chmod 600 /opt/litellm/litellm_config.yaml
 log_ok "Config written to /opt/litellm/litellm_config.yaml"
+
+# Save credentials now (BEFORE container start — Bug #52 fix)
+# Previously at STEP 5, which never ran if container failed
+cat > /opt/litellm/litellm-credentials.txt << EOF
+# Custodian Budget Proxy Credentials
+# Generated: $(date)
+# Keep this file secure. Do not commit to version control.
+LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}
+BUDGET_PROXY_URL=https://${BUDGET_PROXY_DOMAIN}/v1
+BUDGET_PROXY_IP=http://${SERVER_IP}:4000/v1
+EOF
+chmod 600 /opt/litellm/litellm-credentials.txt
+log_ok "Credentials saved to /opt/litellm/litellm-credentials.txt (chmod 600)"
 
 # ============================================================
 # STEP 3: Deploy LiteLLM
@@ -226,34 +245,18 @@ for i in $(seq 1 30); do
 done
 
 # ============================================================
-# STEP 5: Save Credentials
+# STEP 5: Create Admin Virtual Key
 # ============================================================
-log_step "Step 5: Save Credentials"
-
-cat > /opt/litellm/litellm-credentials.txt << EOF
-# Custodian Budget Proxy Credentials
-# Generated: $(date)
-# Keep this file secure. Do not commit to version control.
-LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}
-BUDGET_PROXY_URL=https://${BUDGET_PROXY_DOMAIN}/v1
-BUDGET_PROXY_IP=http://${SERVER_IP}:4000/v1
-EOF
-chmod 600 /opt/litellm/litellm-credentials.txt
-log_ok "Credentials saved to /opt/litellm/litellm-credentials.txt (chmod 600)"
-
-# ============================================================
-# STEP 6: Create initial admin virtual key
-# ============================================================
-log_step "Step 6: Create Admin Virtual Key"
+log_step "Step 5: Create Admin Virtual Key"
 
 ADMIN_KEY_RESPONSE=$(curl -s -X POST http://localhost:4000/key/generate \
-  -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" \
+  -H "Authorization: Bearer ${LITE...EY}" \
   -H "Content-Type: application/json" \
   -d '{
     "key_alias": "admin-key",
     "max_budget": 0,
     "budget_duration": "1mo",
-    "models": ["deepseek-v4-pro", "deepseek-v4-flash"],
+    "models": ["deepseek-chat", "deepseek-v4-pro", "deepseek-v4-flash"],
     "metadata": {"user": "admin", "email": "'"${ADMIN_EMAIL}"'"}
   }' 2>/dev/null)
 
@@ -267,9 +270,9 @@ else
 fi
 
 # ============================================================
-# STEP 7: Verify
+# STEP 6: Verify
 # ============================================================
-log_step "Step 7: Verify"
+log_step "Step 6: Verify"
 
 # Health check
 HEALTH=$(curl -s http://localhost:4000/health 2>/dev/null)
