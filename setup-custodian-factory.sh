@@ -378,7 +378,7 @@ METHOD:
 4. Read every extracted source completely before writing anything
 5. Cross-reference claims: if source A and source B disagree, note the disagreement
 6. Only after all sources are read, synthesize your findings
-7. Write the report
+7. Write the full report directly in your chat response — do NOT save to a file
 
 OUTPUT FORMAT — Structured report with these sections:
 
