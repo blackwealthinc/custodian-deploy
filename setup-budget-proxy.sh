@@ -53,11 +53,18 @@ if [ -z "${DEEPSEEK_API_KEY:-}" ]; then
     exit 1
 fi
 
+if [ -z "${DASHSCOPE_API_KEY:-}" ]; then
+    log_error "DASHSCOPE_API_KEY is required but not set"
+    echo "  Usage: export DASHSCOPE_API_KEY=*** && ... | sudo -E bash"
+    exit 1
+fi
+
 BUDGET_PROXY_DOMAIN="${BUDGET_PROXY_DOMAIN:-budget.ns1net.com}"
 LITELLM_PORT="${LITELLM_PORT:-443}"
 LITELLM_MASTER_KEY=$(openssl rand -hex 32)
 LITELLM_SALT_KEY=$(openssl rand -hex 32)
 _LMK_VN="LITELLM_MASTER""_KEY"  # indirection pattern (Bug #52 fix, DANGER ZONE #11)
+_DSK_VN="DASHSCOPE_""API_KEY"  # indirection pattern (DANGER ZONE #11)
 ADMIN_EMAIL="${ADMIN_EMAIL:-admin@custodian.app}"
 
 # ── Database credentials ──
@@ -175,6 +182,11 @@ model_list:
     litellm_params:
       model: deepseek/deepseek-v4-flash
       api_key: ${DEEPSEEK_API_KEY}
+  - model_name: dashscope-vision
+    litellm_params:
+      model: openai/qwen-vl-max
+      api_base: https://ws-9fl3mot986dsg1so.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1
+      api_key: ${DASHSCOPE_API_KEY}
 
 litellm_settings:
   drop_params: true
@@ -219,6 +231,7 @@ docker run -d \
   -e LITELLM_SALT_KEY="${LITELLM_SALT_KEY}" \
   -e DATABASE_URL="${DATABASE_URL}" \
   -e DEEPSEEK_API_KEY="${DEEPSEEK_API_KEY}" \
+  -e DASHSCOPE_API_KEY="${DASHSCOPE_API_KEY}" \
   -e STORE_MODEL_IN_DB="true" \
   ghcr.io/berriai/litellm-database:main-latest \
   --config /app/config.yaml --port 4000 --host 0.0.0.0
@@ -255,7 +268,7 @@ ADMIN_KEY_RESPONSE=$(curl -s -X POST http://localhost:4000/key/generate \
     "key_alias": "admin-key",
     "max_budget": 0,
     "budget_duration": "1mo",
-    "models": ["deepseek-chat", "deepseek-v4-pro", "deepseek-v4-flash"],
+    "models": ["deepseek-chat", "deepseek-v4-pro", "deepseek-v4-flash", "dashscope-vision"],
     "metadata": {"user": "admin", "email": "'"${ADMIN_EMAIL}"'"}
   }' 2>/dev/null)
 
