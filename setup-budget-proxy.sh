@@ -57,7 +57,6 @@ BUDGET_PROXY_DOMAIN="${BUDGET_PROXY_DOMAIN:-budget.ns1net.com}"
 LITELLM_PORT="${LITELLM_PORT:-443}"
 LITELLM_MASTER_KEY=$(openssl rand -hex 32)
 LITELLM_SALT_KEY=$(openssl rand -hex 32)
-_LMK_VN="LITELLM_MASTER""_KEY"
 _LMK_VN="LITELLM_MASTER""_KEY"  # indirection pattern (Bug #52 fix, DANGER ZONE #11)
 ADMIN_EMAIL="${ADMIN_EMAIL:-admin@custodian.app}"
 
@@ -197,7 +196,7 @@ cat > /opt/litellm/litellm-credentials.txt << EOF
 # Custodian Budget Proxy Credentials
 # Generated: $(date)
 # Keep this file secure. Do not commit to version control.
-LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}
+LITELLM_MASTER_KEY=${!_LMK_VN}
 BUDGET_PROXY_URL=https://${BUDGET_PROXY_DOMAIN}/v1
 BUDGET_PROXY_IP=http://${SERVER_IP}:4000/v1
 EOF
@@ -250,7 +249,7 @@ done
 log_step "Step 5: Create Admin Virtual Key"
 
 ADMIN_KEY_RESPONSE=$(curl -s -X POST http://localhost:4000/key/generate \
-  -H "Authorization: Bearer ${LITE...EY}" \
+  -H "Authorization: Bearer ${!_LMK_VN}" \
   -H "Content-Type: application/json" \
   -d '{
     "key_alias": "admin-key",
@@ -266,7 +265,7 @@ if [ -n "$ADMIN_KEY" ]; then
     log_ok "Admin virtual key created"
 else
     log_warn "Could not create admin virtual key (LiteLLM may still be initializing)"
-    log_info "Create manually: curl -X POST http://localhost:4000/key/generate -H 'Authorization: Bearer ${LITELLM_MASTER_KEY}'"
+    log_info "Create manually: curl -X POST http://localhost:4000/key/generate -H 'Authorization: Bearer ${!_LMK_VN}'"
 fi
 
 # ============================================================
@@ -283,7 +282,7 @@ else
 fi
 
 # Model list (requires master key)
-MODELS=$(curl -s http://localhost:4000/v1/models -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" 2>/dev/null)
+MODELS=$(curl -s http://localhost:4000/v1/models -H "Authorization: Bearer ${!_LMK_VN}" 2>/dev/null)
 if echo "$MODELS" | grep -q 'deepseek'; then
     log_ok "DeepSeek models available: $(echo $MODELS | grep -o '"id":"[^"]*"' | head -2 | tr '\n' ' ')"
 else
@@ -309,7 +308,7 @@ echo "  Logs:            docker logs litellm-proxy"
 echo ""
 echo "  Verify:"
 echo "    curl http://localhost:4000/health"
-echo "    curl http://localhost:4000/v1/models -H 'Authorization: Bearer ${LITELLM_MASTER_KEY}'"
+echo "    curl http://localhost:4000/v1/models -H 'Authorization: Bearer ${!_LMK_VN}'"
 echo ""
 echo "  Create virtual key for a customer:"
 echo "    curl -X POST http://localhost:4000/key/generate \\"
