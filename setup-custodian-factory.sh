@@ -230,6 +230,12 @@ hermes_set model.api_key "${CUSTOMER_API_KEY}" true
 
 # Display (non-fatal)
 hermes_set platforms.api_server.extra.model_name "Custodian AI"
+# Vision routing via Budget Proxy (non-fatal - images use DashScope, text unaffected)
+hermes_set auxiliary.vision.provider custom
+hermes_set auxiliary.vision.model dashscope-vision
+hermes_set auxiliary.vision.base_url "${BUDGET_PROXY_URL}"
+hermes_set auxiliary.vision.api_key "${!_CAK_VN}"
+
 
 # SearXNG connectivity check — uses DNS, not dead config keys
 # The SEARXNG_URL env var (in compose) is what Hermes actually reads
