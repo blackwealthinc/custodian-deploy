@@ -186,7 +186,9 @@ model_list:
     litellm_params:
       model: openai/qwen-vl-max
       api_base: https://ws-9fl3mot986dsg1so.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1
-      api_key: ${DASHSCOPE_API_KEY}
+      api_key: ${!_DSK_VN}
+      input_cost_per_token: 0.0000008
+      output_cost_per_token: 0.0000032
 
 litellm_settings:
   drop_params: true
@@ -231,7 +233,7 @@ docker run -d \
   -e LITELLM_SALT_KEY="${LITELLM_SALT_KEY}" \
   -e DATABASE_URL="${DATABASE_URL}" \
   -e DEEPSEEK_API_KEY="${DEEPSEEK_API_KEY}" \
-  -e DASHSCOPE_API_KEY="${DASHSCOPE_API_KEY}" \
+  -e DASHSCOPE_API_KEY="${!_DSK_VN}" \
   -e STORE_MODEL_IN_DB="true" \
   ghcr.io/berriai/litellm-database:main-latest \
   --config /app/config.yaml --port 4000 --host 0.0.0.0
