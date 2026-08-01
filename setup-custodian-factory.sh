@@ -189,7 +189,8 @@ API_SERVER_KEY=${API_SERVER_KEY}
 WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY}
 CUSTOMER_API_KEY=${!_CAK_VN}
 BUDGET_PROXY_URL=${BUDGET_PROXY_URL}
-EOFchmod 600 .env.${CUSTOMER_ID}-factory
+EOF
+chmod 600 .env.${CUSTOMER_ID}-factory
 log_ok 'Keys saved'
 
 log_step 'Step 5: Configure Hermes Routing'
@@ -535,6 +536,109 @@ elif echo "$STEP5D_OUTPUT" | grep -q 'SKIP'; then
 else
   log_warn "Model creation failed (non-fatal)"
   log_warn "Output: $STEP5D_OUTPUT"
+fi
+
+log_step 'Step 5e: Register Vision Model + LiteLLM Routing'
+
+# Bug #57: Vision Router filter routes to dashscope-vision but OpenWebUI
+# validates models AFTER filter execution. dashscope-vision must be a known
+# model AND must route directly to LiteLLM (bypassing Hermes, which overrides
+# all model names to deepseek-v4-pro).
+cat > /tmp/inject_vision_model.py << 'PYEOF'
+import sqlite3, json, time
+
+conn = sqlite3.connect('/app/backend/data/webui.db')
+now = int(time.time())
+
+# Read current OpenAI connections
+rows = conn.execute(
+    "SELECT key, value FROM config WHERE key IN (?, ?, ?)",
+    ("openai.api_configs", "openai.api_base_urls", "openai.api_keys")
+).fetchall()
+configs = {r[0]: json.loads(r[1]) if r[1] else (
+    [] if "urls" in r[0] or "keys" in r[0] else {}
+) for r in rows}
+
+changes = 0
+
+# Add LiteLLM as second connection (index 1) if not present
+liteLLM_url = "http://100.64.0.1:4000/v1"
+urls = configs.get("openai.api_base_urls", [])
+if liteLLM_url not in urls:
+    keys = configs.get("openai.api_keys", [])
+    # Use same key as Hermes (customer LiteLLM virtual key from Hermes config)
+    # Hermes config has this key at model.api_key
+    import subprocess, yaml
+    result = subprocess.run(["cat", "/opt/data/config.yaml"],
+        capture_output=True, text=True)
+    hermes_cfg = yaml.safe_load(result.stdout)
+    liteLLM_key = hermes_cfg["model"]["api_key"]
+    
+    urls.append(liteLLM_url)
+    keys.append(liteLLM_key)
+    conn.execute("UPDATE config SET value=? WHERE key=?",
+        (json.dumps(urls), "openai.api_base_urls"))
+    conn.execute("UPDATE config SET value=? WHERE key=?",
+        (json.dumps(keys), "openai.api_keys"))
+    changes += 1
+
+# Set per-model routing: dashscope-vision -> LiteLLM directly
+api_cfgs = configs.get("openai.api_configs", {})
+if "dashscope-vision" not in api_cfgs:
+    api_cfgs["dashscope-vision"] = {
+        "api_base_url": liteLLM_url,
+        "api_key": liteLLM_key
+    }
+    conn.execute("UPDATE config SET value=? WHERE key=?",
+        (json.dumps(api_cfgs), "openai.api_configs"))
+    changes += 1
+
+# UPSERT dashscope-vision model
+import uuid
+model_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, 'dashscope-vision-model'))
+meta = json.dumps({"capabilities": {"vision": True}})
+
+existing = conn.execute(
+    "SELECT id FROM model WHERE name=?", ("dashscope-vision",)
+).fetchone()
+
+if existing:
+    conn.execute("UPDATE model SET meta=?, updated_at=? WHERE id=?",
+        (meta, now, existing[0]))
+else:
+    conn.execute(
+        "INSERT INTO model (id, user_id, base_model_id, name, params, meta, is_active, created_at, updated_at) "
+        "VALUES (?, NULL, ?, ?, ?, ?, TRUE, ?, ?)",
+        (model_id, "dashscope-vision", "dashscope-vision", "{}", meta, now, now)
+    )
+    changes += 1
+
+conn.commit()
+conn.close()
+print(f"OK:{changes}")
+PYEOF
+
+docker cp /tmp/inject_vision_model.py "$WEBUI_CONTAINER":/tmp/
+STEP5E_OUTPUT=$(docker exec "$WEBUI_CONTAINER" python3 /tmp/inject_vision_model.py 2>&1)
+docker exec "$WEBUI_CONTAINER" rm /tmp/inject_vision_model.py 2>/dev/null || true
+rm /tmp/inject_vision_model.py
+
+if echo "$STEP5E_OUTPUT" | grep -q 'OK'; then
+  log_ok "Vision model + LiteLLM routing configured"
+  # Restart WebUI to reload models and connections
+  log_info "Restarting WebUI to refresh model cache..."
+  docker restart "$WEBUI_CONTAINER" >/dev/null 2>&1
+  for i in $(seq 1 30); do
+    if curl -s -o /dev/null -w '%{http_code}' "http://localhost:${WEBUI_PORT:-3000}" 2>/dev/null | grep -qE '200|302'; then
+      break
+    fi
+    [ "$i" -eq 30 ] && log_warn "WebUI slow to restart — check manually"
+    sleep 2
+  done
+  log_ok "WebUI restarted — vision routing active"
+else
+  log_warn "Vision model setup failed (non-fatal)"
+  log_warn "Output: $STEP5E_OUTPUT"
 fi
 
 log_step 'Step 6: Verify'
