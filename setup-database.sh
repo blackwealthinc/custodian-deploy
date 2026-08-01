@@ -19,7 +19,7 @@
 #   DB_PORT            — PostgreSQL port (default: 5432)
 #
 # One-liner:
-#   curl -s https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/setup-database.sh | sudo bash
+#   curl -s https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/setup-database.sh | sudo -E bash
 #
 # Architecture: custodian-architecture-budget-proxy-scaling.md § 9
 # ============================================================================
