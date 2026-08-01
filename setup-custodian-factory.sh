@@ -493,7 +493,8 @@ model_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, 'custodian-model'))
 
 meta = json.dumps({
     "capabilities": {
-        "web_search": True
+        "web_search": True,
+        "vision": True
     },
     "description": "Custodian AI — Hermes + DeepSeek via Budget Proxy"
 })
@@ -515,9 +516,9 @@ rm /tmp/create_model.py
 
 if echo "$STEP5D_OUTPUT" | grep -qE 'OK|UPDATED'; then
   if echo "$STEP5D_OUTPUT" | grep -q 'UPDATED'; then
-    log_ok "Custodian workspace model updated — web search toggle refreshed"
+    log_ok "Custodian workspace model updated — web search + vision capabilities refreshed"
   else
-    log_ok "Custodian workspace model created — web search toggle enabled"
+    log_ok "Custodian workspace model created — web search + vision capabilities enabled"
   fi
   # Bug #48: Restart WebUI to reload model cache (new/updated model won't show until restart)
   log_info "Restarting WebUI to refresh model cache..."
