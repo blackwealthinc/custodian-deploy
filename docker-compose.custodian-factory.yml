@@ -51,7 +51,7 @@ services:
       - searxng-net
 
   openwebui:
-    image: ghcr.io/open-webui/open-webui:v0.10.2  # pinned — update WEBUI_PINNED_VERSION in setup script too
+    image: ghcr.io/open-webui/open-webui:v0.11.0  # pinned — update WEBUI_PINNED_VERSION in setup script too
     container_name: ${CUSTOMER_ID:-custodian}-webui
     restart: unless-stopped
 

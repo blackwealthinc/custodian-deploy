@@ -79,7 +79,7 @@ fi
 HERMES_PINNED_VERSION="v2026.7.20"
 HERMES_PINNED_DIGEST="sha256:0e06e95613c7536e14f33e9dd5f7c15db676fc25c6c13e350c69ce47e1464033"
 # Open WebUI version pin -- update when upgrading
-WEBUI_PINNED_VERSION="v0.10.2"
+WEBUI_PINNED_VERSION="v0.11.0"
 
 SERVER_IP=$(hostname -I | awk '{print $1}')
 COMPOSE_URL="https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/docker-compose.custodian-factory.yml"
@@ -502,8 +502,8 @@ meta = json.dumps({
 now = int(time.time())
 
 conn.execute('''INSERT INTO model (id, user_id, base_model_id, name, params, meta, is_active, created_at, updated_at)
-VALUES (?, NULL, ?, ?, ?, ?, TRUE, ?, ?)''',
-    (model_id, 'Custodian', 'Custodian', json.dumps({}), meta, now, now))
+VALUES (?, ?, ?, ?, ?, ?, TRUE, ?, ?)''',
+    (model_id, '', 'Custodian', 'Custodian', json.dumps({}), meta, now, now))
 conn.commit()
 conn.close()
 print('OK')
@@ -609,8 +609,8 @@ if existing:
 else:
     conn.execute(
         "INSERT INTO model (id, user_id, base_model_id, name, params, meta, is_active, created_at, updated_at) "
-        "VALUES (?, NULL, ?, ?, ?, ?, TRUE, ?, ?)",
-        (model_id, "dashscope-vision", "dashscope-vision", "{}", meta, now, now)
+        "VALUES (?, ?, ?, ?, ?, ?, TRUE, ?, ?)",
+        (model_id, '', "dashscope-vision", "dashscope-vision", "{}", meta, now, now)
     )
     changes += 1
 
