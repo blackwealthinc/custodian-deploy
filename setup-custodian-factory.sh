@@ -78,9 +78,6 @@ fi
 # Find current: docker run --rm nousresearch/hermes-agent:latest hermes --version
 HERMES_PINNED_VERSION="v2026.7.20"
 HERMES_PINNED_DIGEST="sha256:0e06e95613c7536e14f33e9dd5f7c15db676fc25c6c13e350c69ce47e1464033"
-# Open WebUI version pin -- update when upgrading
-WEBUI_PINNED_VERSION="v0.11.0"
-
 SERVER_IP=$(hostname -I | awk '{print $1}')
 COMPOSE_URL="https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/docker-compose.custodian-factory.yml"
 
