@@ -595,8 +595,7 @@ if "dashscope-vision" not in api_cfgs:
     changes += 1
 
 # UPSERT dashscope-vision model
-import uuid
-model_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, 'dashscope-vision-model'))
+model_id = 'dashscope-vision'
 meta = json.dumps({"capabilities": {"vision": True}})
 
 existing = conn.execute(
