@@ -36,7 +36,7 @@ if [ -z "${!_CAK_VN:-}" ]; then
   KEY_RESPONSE=$(curl -s -X POST "${BUDGET_PROXY_URL%/v1}/key/generate" \
     -H "Authorization: Bearer ${!_LMK_VN}" \
     -H "Content-Type: application/json" \
-    -d "{\"key_alias\": \"${CUSTOMER_ID:-custodian}\", \"models\": [\"deepseek-v4-pro\"], \"max_budget\": ${MAX_BUDGET:-25}, \"budget_duration\": \"1mo\"}" 2>/dev/null)
+    -d "{\"key_alias\": \"${CUSTOMER_ID:-custodian}\", \"models\": [\"deepseek-v4-pro\", \"gpt-image-2-hd\"], \"max_budget\": ${MAX_BUDGET:-25}, \"budget_duration\": \"1mo\"}" 2>/dev/null)
   _RAW_KEY=$(echo "$KEY_RESPONSE" | grep -o '"key":"[^"]*"' | head -1 | cut -d'"' -f4)
   if [ -z "${_RAW_KEY}" ]; then
     echo "ERROR: Failed to auto-generate API key. Response:"
@@ -584,6 +584,20 @@ if liteLLM_url not in urls:
 api_cfgs = configs.get("openai.api_configs", {})
 if "dashscope-vision" not in api_cfgs:
     api_cfgs["dashscope-vision"] = {
+        "api_base_url": liteLLM_url,
+        "api_key": liteLLM_key
+    }
+    conn.execute("UPDATE config SET value=? WHERE key=?",
+        (json.dumps(api_cfgs), "openai.api_configs"))
+    changes += 1
+
+# Set per-model routing: gpt-image-2-hd -> LiteLLM directly (reuse same connection)
+# Same URL, same key — different model, same budget pool
+api_cfgs = json.loads(conn.execute(
+    "SELECT value FROM config WHERE key='openai.api_configs'"
+).fetchone()[0])
+if "gpt-image-2-hd" not in api_cfgs:
+    api_cfgs["gpt-image-2-hd"] = {
         "api_base_url": liteLLM_url,
         "api_key": liteLLM_key
     }
