@@ -605,6 +605,23 @@ if "gpt-image-2-hd" not in api_cfgs:
         (json.dumps(api_cfgs), "openai.api_configs"))
     changes += 1
 
+# Bug #76: Inject image_generation DB config — env vars are silently overridden
+# OpenWebUI's ENABLE_PERSISTENT_CONFIG=True (default) makes DB values authoritative
+# Without this, correct env vars are ignored and image generation stays disabled
+conn.execute("UPDATE config SET value=? WHERE key=?",
+    (json.dumps(True), "image_generation.enable"))
+conn.execute("UPDATE config SET value=? WHERE key=?",
+    (json.dumps("openai"), "image_generation.engine"))
+conn.execute("UPDATE config SET value=? WHERE key=?",
+    (json.dumps("gpt-image-2-hd"), "image_generation.model"))
+conn.execute("UPDATE config SET value=? WHERE key=?",
+    (json.dumps("1024x1024"), "image_generation.size"))
+conn.execute("UPDATE config SET value=? WHERE key=?",
+    (json.dumps(liteLLM_url), "image_generation.openai.api_base_url"))
+conn.execute("UPDATE config SET value=? WHERE key=?",
+    (json.dumps(liteLLM_key), "image_generation.openai.api_key"))
+changes += 6
+
 # UPSERT dashscope-vision model
 model_id = 'dashscope-vision'
 meta = json.dumps({"capabilities": {"vision": True}})
