@@ -189,6 +189,12 @@ model_list:
       api_key: ${!_DSK_VN}
       input_cost_per_token: 0.0000008
       output_cost_per_token: 0.0000032
+  - model_name: gpt-image-2-hd
+    litellm_params:
+      model: openai/gpt-image-2
+      api_key: ${OPENAI_API_KEY}
+      quality: hd
+      size: 1024x1024
 
 litellm_settings:
   drop_params: true
@@ -270,7 +276,7 @@ ADMIN_KEY_RESPONSE=$(curl -s -X POST http://localhost:4000/key/generate \
     "key_alias": "admin-key",
     "max_budget": 0,
     "budget_duration": "1mo",
-    "models": ["deepseek-chat", "deepseek-v4-pro", "deepseek-v4-flash", "dashscope-vision"],
+    "models": ["deepseek-chat", "deepseek-v4-pro", "deepseek-v4-flash", "dashscope-vision", "gpt-image-2-hd"],
     "metadata": {"user": "admin", "email": "'"${ADMIN_EMAIL}"'"}
   }' 2>/dev/null)
 

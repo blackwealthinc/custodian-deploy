@@ -68,7 +68,7 @@ services:
       - IMAGE_GENERATION_ENGINE=openai
       - IMAGE_GENERATION_MODEL=gpt-image-2-hd
       - IMAGE_SIZE=1024x1024
-      - IMAGES_OPENAI_API_BASE_URL=http://100.64.0.1:4000/v1
+      - IMAGES_OPENAI_API_BASE_URL=${BUD...URL}
       - IMAGES_OPENAI_API_KEY=${CUSTOMER_API_KEY}
 
     volumes:
