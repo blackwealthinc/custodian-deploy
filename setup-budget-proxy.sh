@@ -59,12 +59,19 @@ if [ -z "${DASHSCOPE_API_KEY:-}" ]; then
     exit 1
 fi
 
+if [ -z "${OPENAI_API_KEY:-}" ]; then
+    log_error "OPENAI_API_KEY is required but not set"
+    echo "  Usage: export OPENAI_API_KEY=*** && ... | sudo -E bash"
+    exit 1
+fi
+
 BUDGET_PROXY_DOMAIN="${BUDGET_PROXY_DOMAIN:-budget.ns1net.com}"
 LITELLM_PORT="${LITELLM_PORT:-443}"
 LITELLM_MASTER_KEY=$(openssl rand -hex 32)
 LITELLM_SALT_KEY=$(openssl rand -hex 32)
 _LMK_VN="LITELLM_MASTER""_KEY"  # indirection pattern (Bug #52 fix, DANGER ZONE #11)
 _DSK_VN="DASHSCOPE_""API_KEY"  # indirection pattern (DANGER ZONE #11)
+_OAI_VN="OPENAI_""API_KEY"     # indirection pattern — image generation
 ADMIN_EMAIL="${ADMIN_EMAIL:-admin@custodian.app}"
 
 # ── Database credentials ──
@@ -192,7 +199,7 @@ model_list:
   - model_name: gpt-image-2-hd
     litellm_params:
       model: openai/gpt-image-2
-      api_key: ${OPENAI_API_KEY}
+      api_key: ${!_OAI_VN}
       quality: hd
       size: 1024x1024
 
