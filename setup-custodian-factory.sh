@@ -491,7 +491,8 @@ model_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, 'custodian-model'))
 meta = json.dumps({
     "capabilities": {
         "web_search": True,
-        "vision": True
+        "vision": True,
+        "image_generation": True
     },
     "description": "Custodian AI — Hermes + DeepSeek via Budget Proxy"
 })
