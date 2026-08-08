@@ -200,7 +200,7 @@ model_list:
     litellm_params:
       model: openai/gpt-image-2
       api_key: ${!_OAI_VN}
-      quality: high
+      quality: auto
       size: 1024x1024
 
 litellm_settings:
