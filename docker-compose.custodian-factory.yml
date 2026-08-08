@@ -51,7 +51,7 @@ services:
       - searxng-net
 
   openwebui:
-    image: ghcr.io/open-webui/open-webui:v0.10.2  # pinned — update WEBUI_PINNED_VERSION in setup script too
+    image: ghcr.io/open-webui/open-webui:v0.11.0  # pinned — update WEBUI_PINNED_VERSION in setup script too
     container_name: ${CUSTOMER_ID:-custodian}-webui
     restart: unless-stopped
 
@@ -63,6 +63,13 @@ services:
       - ENABLE_WEB_SEARCH=true
       - WEB_SEARCH_ENGINE=searxng
       - SEARXNG_QUERY_URL=http://searxng:8080/search?q=<query>
+      # Image generation — DALL-E HD via LiteLLM budget proxy
+      - ENABLE_IMAGE_GENERATION=true
+      - IMAGE_GENERATION_ENGINE=openai
+      - IMAGE_GENERATION_MODEL=gpt-image-2-hd
+      - IMAGE_SIZE=1024x1024
+      - IMAGES_OPENAI_API_BASE_URL=${BUD...URL}
+      - IMAGES_OPENAI_API_KEY=${CUSTOMER_API_KEY}
 
     volumes:
       - ./webui-data:/app/backend/data

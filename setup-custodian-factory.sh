@@ -36,7 +36,7 @@ if [ -z "${!_CAK_VN:-}" ]; then
   KEY_RESPONSE=$(curl -s -X POST "${BUDGET_PROXY_URL%/v1}/key/generate" \
     -H "Authorization: Bearer ${!_LMK_VN}" \
     -H "Content-Type: application/json" \
-    -d "{\"key_alias\": \"${CUSTOMER_ID:-custodian}\", \"models\": [\"deepseek-v4-pro\"], \"max_budget\": ${MAX_BUDGET:-25}, \"budget_duration\": \"1mo\"}" 2>/dev/null)
+    -d "{\"key_alias\": \"${CUSTOMER_ID:-custodian}\", \"models\": [\"deepseek-v4-pro\", \"gpt-image-2-hd\"], \"max_budget\": ${MAX_BUDGET:-25}, \"budget_duration\": \"1mo\"}" 2>/dev/null)
   _RAW_KEY=$(echo "$KEY_RESPONSE" | grep -o '"key":"[^"]*"' | head -1 | cut -d'"' -f4)
   if [ -z "${_RAW_KEY}" ]; then
     echo "ERROR: Failed to auto-generate API key. Response:"
@@ -78,9 +78,6 @@ fi
 # Find current: docker run --rm nousresearch/hermes-agent:latest hermes --version
 HERMES_PINNED_VERSION="v2026.7.20"
 HERMES_PINNED_DIGEST="sha256:0e06e95613c7536e14f33e9dd5f7c15db676fc25c6c13e350c69ce47e1464033"
-# Open WebUI version pin -- update when upgrading
-WEBUI_PINNED_VERSION="v0.10.2"
-
 SERVER_IP=$(hostname -I | awk '{print $1}')
 COMPOSE_URL="https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/docker-compose.custodian-factory.yml"
 
@@ -493,7 +490,9 @@ model_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, 'custodian-model'))
 
 meta = json.dumps({
     "capabilities": {
-        "web_search": True
+        "web_search": True,
+        "vision": True,
+        "image_generation": True
     },
     "description": "Custodian AI — Hermes + DeepSeek via Budget Proxy"
 })
@@ -501,8 +500,8 @@ meta = json.dumps({
 now = int(time.time())
 
 conn.execute('''INSERT INTO model (id, user_id, base_model_id, name, params, meta, is_active, created_at, updated_at)
-VALUES (?, NULL, ?, ?, ?, ?, TRUE, ?, ?)''',
-    (model_id, 'Custodian', 'Custodian', json.dumps({}), meta, now, now))
+VALUES (?, ?, ?, ?, ?, ?, TRUE, ?, ?)''',
+    (model_id, '', 'Custodian', 'Custodian', json.dumps({}), meta, now, now))
 conn.commit()
 conn.close()
 print('OK')
@@ -515,9 +514,9 @@ rm /tmp/create_model.py
 
 if echo "$STEP5D_OUTPUT" | grep -qE 'OK|UPDATED'; then
   if echo "$STEP5D_OUTPUT" | grep -q 'UPDATED'; then
-    log_ok "Custodian workspace model updated — web search toggle refreshed"
+    log_ok "Custodian workspace model updated — web search + vision capabilities refreshed"
   else
-    log_ok "Custodian workspace model created — web search toggle enabled"
+    log_ok "Custodian workspace model created — web search + vision capabilities enabled"
   fi
   # Bug #48: Restart WebUI to reload model cache (new/updated model won't show until restart)
   log_info "Restarting WebUI to refresh model cache..."
@@ -593,9 +592,39 @@ if "dashscope-vision" not in api_cfgs:
         (json.dumps(api_cfgs), "openai.api_configs"))
     changes += 1
 
+# Set per-model routing: gpt-image-2-hd -> LiteLLM directly (reuse same connection)
+# Same URL, same key — different model, same budget pool
+api_cfgs = json.loads(conn.execute(
+    "SELECT value FROM config WHERE key='openai.api_configs'"
+).fetchone()[0])
+if "gpt-image-2-hd" not in api_cfgs:
+    api_cfgs["gpt-image-2-hd"] = {
+        "api_base_url": liteLLM_url,
+        "api_key": liteLLM_key
+    }
+    conn.execute("UPDATE config SET value=? WHERE key=?",
+        (json.dumps(api_cfgs), "openai.api_configs"))
+    changes += 1
+
+# Bug #76: Inject image_generation DB config — env vars are silently overridden
+# OpenWebUI's ENABLE_PERSISTENT_CONFIG=True (default) makes DB values authoritative
+# Without this, correct env vars are ignored and image generation stays disabled
+conn.execute("UPDATE config SET value=? WHERE key=?",
+    (json.dumps(True), "image_generation.enable"))
+conn.execute("UPDATE config SET value=? WHERE key=?",
+    (json.dumps("openai"), "image_generation.engine"))
+conn.execute("UPDATE config SET value=? WHERE key=?",
+    (json.dumps("gpt-image-2-hd"), "image_generation.model"))
+conn.execute("UPDATE config SET value=? WHERE key=?",
+    (json.dumps("1024x1024"), "image_generation.size"))
+conn.execute("UPDATE config SET value=? WHERE key=?",
+    (json.dumps(liteLLM_url), "image_generation.openai.api_base_url"))
+conn.execute("UPDATE config SET value=? WHERE key=?",
+    (json.dumps(liteLLM_key), "image_generation.openai.api_key"))
+changes += 6
+
 # UPSERT dashscope-vision model
-import uuid
-model_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, 'dashscope-vision-model'))
+model_id = 'dashscope-vision'
 meta = json.dumps({"capabilities": {"vision": True}})
 
 existing = conn.execute(
@@ -608,8 +637,8 @@ if existing:
 else:
     conn.execute(
         "INSERT INTO model (id, user_id, base_model_id, name, params, meta, is_active, created_at, updated_at) "
-        "VALUES (?, NULL, ?, ?, ?, ?, TRUE, ?, ?)",
-        (model_id, "dashscope-vision", "dashscope-vision", "{}", meta, now, now)
+        "VALUES (?, ?, ?, ?, ?, ?, TRUE, ?, ?)",
+        (model_id, '', "dashscope-vision", "dashscope-vision", "{}", meta, now, now)
     )
     changes += 1
 

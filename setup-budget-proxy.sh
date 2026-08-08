@@ -59,9 +59,15 @@ if [ -z "${DASHSCOPE_API_KEY:-}" ]; then
     exit 1
 fi
 
+if [ -z "${OPENAI_API_KEY:-}" ]; then
+    log_error "OPENAI_API_KEY is required but not set"
+    echo "  Usage: export OPENAI_API_KEY=*** && ... | sudo -E bash"
+    exit 1
+fi
+
 BUDGET_PROXY_DOMAIN="${BUDGET_PROXY_DOMAIN:-budget.ns1net.com}"
 LITELLM_PORT="${LITELLM_PORT:-443}"
-LITELLM_MASTER_KEY=$(openssl rand -hex 32)
+LITELLM_MASTER_KEY="sk-$(openssl rand -hex 32)"
 LITELLM_SALT_KEY=$(openssl rand -hex 32)
 _LMK_VN="LITELLM_MASTER""_KEY"  # indirection pattern (Bug #52 fix, DANGER ZONE #11)
 _DSK_VN="DASHSCOPE_""_API_KEY"  # indirection pattern (DANGER ZONE #11)
@@ -242,7 +248,7 @@ docker run -d \
   -e DEEPSEEK_API_KEY="${DEEPSEEK_API_KEY}" \
   -e DASHSCOPE_API_KEY="${!_DSK_VN}" \
   -e STORE_MODEL_IN_DB="true" \
-  ghcr.io/berriai/litellm-database:main-latest \
+  ghcr.io/berriai/litellm-database:v1.95.0 \
   --config /app/config.yaml --port 4000 --host 0.0.0.0
 
 log_ok "LiteLLM container started"
@@ -277,7 +283,7 @@ ADMIN_KEY_RESPONSE=$(curl -s -X POST http://localhost:4000/key/generate \
     "key_alias": "admin-key",
     "max_budget": 0,
     "budget_duration": "1mo",
-    "models": ["deepseek-chat", "deepseek-v4-pro", "deepseek-v4-flash", "dashscope-vision"],
+    "models": ["deepseek-chat", "deepseek-v4-pro", "deepseek-v4-flash", "dashscope-vision", "gpt-image-2-hd"],
     "metadata": {"user": "admin", "email": "'"${ADMIN_EMAIL}"'"}
   }' 2>/dev/null)
 
