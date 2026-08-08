@@ -64,7 +64,8 @@ LITELLM_PORT="${LITELLM_PORT:-443}"
 LITELLM_MASTER_KEY=$(openssl rand -hex 32)
 LITELLM_SALT_KEY=$(openssl rand -hex 32)
 _LMK_VN="LITELLM_MASTER""_KEY"  # indirection pattern (Bug #52 fix, DANGER ZONE #11)
-_DSK_VN="DASHSCOPE_""API_KEY"  # indirection pattern (DANGER ZONE #11)
+_DSK_VN="DASHSCOPE_""_API_KEY"  # indirection pattern (DANGER ZONE #11)
+_OAI_VN="OPENAI_""_API_KEY"     # indirection pattern — image generation
 ADMIN_EMAIL="${ADMIN_EMAIL:-admin@custodian.app}"
 
 # ── Database credentials ──
@@ -189,6 +190,12 @@ model_list:
       api_key: ${!_DSK_VN}
       input_cost_per_token: 0.0000008
       output_cost_per_token: 0.0000032
+  - model_name: gpt-image-2-hd
+    litellm_params:
+      model: openai/gpt-image-2
+      api_key: ${!_OAI_VN}
+      quality: high
+      size: 1024x1024
 
 litellm_settings:
   drop_params: true
