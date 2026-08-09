@@ -476,6 +476,16 @@ conn = sqlite3.connect('/app/backend/data/webui.db')
 
 # Bug #49: UPSERT — update existing model with latest capabilities instead of skipping
 now = int(time.time())
+
+# Custodian model meta — defined BEFORE UPSERT (Bug #87: meta was undefined in UPDATE path)
+meta = json.dumps({
+    "capabilities": {
+        "web_search": True,
+        "vision": True
+    },
+    "description": "Custodian AI — Hermes + DeepSeek via Budget Proxy. For images, switch to 'Custodian Images' model."
+})
+
 # UPSERT Custodian model
 existing = conn.execute("SELECT id FROM model WHERE name='Custodian'").fetchone()
 if existing:
