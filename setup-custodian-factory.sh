@@ -36,7 +36,7 @@ if [ -z "${!_CAK_VN:-}" ]; then
   KEY_RESPONSE=$(curl -s -X POST "${BUDGET_PROXY_URL%/v1}/key/generate" \
     -H "Authorization: Bearer ${!_LMK_VN}" \
     -H "Content-Type: application/json" \
-    -d "{\"key_alias\": \"${CUSTOMER_ID:-custodian}\", \"models\": [\"deepseek-v4-pro\", \"gpt-image-2-hd\"], \"max_budget\": ${MAX_BUDGET:-25}, \"budget_duration\": \"1mo\"}" 2>/dev/null)
+    -d "{\"key_alias\": \"${CUSTOMER_ID:-custodian}\", \"models\": [\"deepseek-v4-pro\", \"deepseek-v4-flash\", \"deepseek-chat\", \"dashscope-vision\", \"gpt-image-2-hd\"], \"max_budget\": ${MAX_BUDGET:-25}, \"budget_duration\": \"1mo\"}" 2>/dev/null)
   _RAW_KEY=$(echo "$KEY_RESPONSE" | grep -o '"key":"[^"]*"' | head -1 | cut -d'"' -f4)
   if [ -z "${_RAW_KEY}" ]; then
     echo "ERROR: Failed to auto-generate API key. Response:"
@@ -476,35 +476,45 @@ conn = sqlite3.connect('/app/backend/data/webui.db')
 
 # Bug #49: UPSERT — update existing model with latest capabilities instead of skipping
 now = int(time.time())
+# UPSERT Custodian model
 existing = conn.execute("SELECT id FROM model WHERE name='Custodian'").fetchone()
 if existing:
     conn.execute('UPDATE model SET meta=?, updated_at=? WHERE id=?',
         (meta, now, existing[0]))
-    conn.commit()
-    conn.close()
-    print('UPDATED')
-    exit(0)
+    was_update = True
+else:
+    model_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, 'custodian-model'))
+    conn.execute('''INSERT INTO model (id, user_id, base_model_id, name, params, meta, is_active, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, TRUE, ?, ?)''',
+        (model_id, '', 'Custodian', 'Custodian', json.dumps({}), meta, now, now))
+    was_update = False
 
-# Deterministic ID — same on every run for the same customer
-model_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, 'custodian-model'))
-
-meta = json.dumps({
+# UPSERT Custodian Images model (Bug #84 fix — now runs on re-runs too)
+image_model_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, 'custodian-images'))
+image_meta = json.dumps({
     "capabilities": {
-        "web_search": True,
-        "vision": True,
         "image_generation": True
     },
-    "description": "Custodian AI — Hermes + DeepSeek via Budget Proxy"
+    "description": "DALL-E HD image generation via LiteLLM. Images auto-deleted after 3 days. Save important ones locally."
 })
 
-now = int(time.time())
+existing_img = conn.execute(
+    "SELECT id FROM model WHERE name='Custodian Images'"
+).fetchone()
 
-conn.execute('''INSERT INTO model (id, user_id, base_model_id, name, params, meta, is_active, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, TRUE, ?, ?)''',
-    (model_id, '', 'Custodian', 'Custodian', json.dumps({}), meta, now, now))
+if existing_img:
+    conn.execute('UPDATE model SET meta=?, updated_at=? WHERE id=?',
+        (image_meta, now, existing_img[0]))
+else:
+    conn.execute(
+        "INSERT INTO model (id, user_id, base_model_id, name, params, meta, is_active, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, TRUE, ?, ?)",
+        (image_model_id, '', 'gpt-image-2-hd', 'Custodian Images', json.dumps({}), image_meta, now, now)
+    )
+
 conn.commit()
 conn.close()
-print('OK')
+print('UPDATED' if was_update else 'CREATED')
 PYEOF
 
 docker cp /tmp/create_model.py "$WEBUI_CONTAINER":/tmp/
@@ -512,11 +522,11 @@ STEP5D_OUTPUT=$(docker exec "$WEBUI_CONTAINER" python3 /tmp/create_model.py 2>&1
 docker exec "$WEBUI_CONTAINER" rm /tmp/create_model.py 2>/dev/null || true
 rm /tmp/create_model.py
 
-if echo "$STEP5D_OUTPUT" | grep -qE 'OK|UPDATED'; then
+if echo "$STEP5D_OUTPUT" | grep -qE 'CREATED|UPDATED'; then
   if echo "$STEP5D_OUTPUT" | grep -q 'UPDATED'; then
-    log_ok "Custodian workspace model updated — web search + vision capabilities refreshed"
+    log_ok "Custodian models updated — chat + image generation refreshed"
   else
-    log_ok "Custodian workspace model created — web search + vision capabilities enabled"
+    log_ok "Custodian models created — chat + image generation enabled"
   fi
   # Bug #48: Restart WebUI to reload model cache (new/updated model won't show until restart)
   log_info "Restarting WebUI to refresh model cache..."
@@ -565,13 +575,11 @@ liteLLM_url = "http://100.64.0.1:4000/v1"
 urls = configs.get("openai.api_base_urls", [])
 if liteLLM_url not in urls:
     keys = configs.get("openai.api_keys", [])
-    # Use same key as Hermes (customer LiteLLM virtual key from Hermes config)
-    # Hermes config has this key at model.api_key
-    import subprocess, yaml
-    result = subprocess.run(["cat", "/opt/data/config.yaml"],
-        capture_output=True, text=True)
-    hermes_cfg = yaml.safe_load(result.stdout)
-    liteLLM_key = hermes_cfg["model"]["api_key"]
+    # Use IMAGES_OPENAI_API_KEY — set by Docker Compose (${CUSTOMER_API_KEY})
+    # Available inside the WebUI container env. No docker exec needed.
+    liteLLM_key = os.environ.get("IMAGES_OPENAI_API_KEY", "")
+    if not liteLLM_key:
+        liteLLM_key = keys[-1] if keys else ""
     
     urls.append(liteLLM_url)
     keys.append(liteLLM_key)
@@ -721,6 +729,36 @@ if docker network inspect extractor-net >/dev/null 2>&1; then
 else
   log_info "PullMD not deployed — web extraction unavailable (optional)"
 fi
+
+log_step 'Step 5f: Image Cleanup Timer'
+
+cat > /etc/systemd/system/custodian-cleanup.service << 'UNITEOF'
+[Unit]
+Description=Custodian — Delete old generated images and uploads
+
+[Service]
+Type=oneshot
+# Delete generated images older than 3 days
+ExecStart=/usr/bin/find /home/custodian/webui-data/uploads -name '*_generated-image.*' -mtime +3 -delete
+# Delete uploaded files/screenshots older than 30 days
+ExecStart=/usr/bin/find /home/custodian/webui-data/uploads ! -name '*_generated-image.*' -mtime +30 -delete
+UNITEOF
+
+cat > /etc/systemd/system/custodian-cleanup.timer << 'UNITEOF'
+[Unit]
+Description=Daily cleanup of old Custodian images and uploads
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNITEOF
+
+systemctl daemon-reload
+systemctl enable --now custodian-cleanup.timer
+log_ok 'Cleanup timer active (generated images: 3 days, uploads: 30 days)'
 
 echo ''
 echo '=== CUSTODIAN — READY ==='
