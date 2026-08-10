@@ -748,10 +748,7 @@ Description=Custodian — Delete old generated images and uploads
 
 [Service]
 Type=oneshot
-# Delete generated images older than 3 days
-ExecStart=/usr/bin/find /home/custodian/webui-data/uploads -name '*_generated-image.*' -mtime +3 -delete
-# Delete uploaded files/screenshots older than 30 days
-ExecStart=/usr/bin/find /home/custodian/webui-data/uploads ! -name '*_generated-image.*' -mtime +30 -delete
+ExecStart=/usr/bin/find /home/custodian/webui-data/uploads -name "*_generated-image.*" -mtime +3 -delete
 UNITEOF
 
 cat > /etc/systemd/system/custodian-cleanup.timer << 'UNITEOF'
@@ -768,7 +765,7 @@ UNITEOF
 
 systemctl daemon-reload
 systemctl enable --now custodian-cleanup.timer
-log_ok 'Cleanup timer active (generated images: 3 days, uploads: 30 days)'
+log_ok 'Cleanup timer active (generated images: 3 days)'
 
 echo ''
 echo '=== CUSTODIAN — READY ==='
