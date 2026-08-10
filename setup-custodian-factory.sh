@@ -36,7 +36,7 @@ if [ -z "${!_CAK_VN:-}" ]; then
   KEY_RESPONSE=$(curl -s -X POST "${BUDGET_PROXY_URL%/v1}/key/generate" \
     -H "Authorization: Bearer ${!_LMK_VN}" \
     -H "Content-Type: application/json" \
-    -d "{\"key_alias\": \"${CUSTOMER_ID:-custodian}\", \"models\": [\"deepseek-v4-pro\", \"deepseek-v4-flash\", \"deepseek-chat\", \"dashscope-vision\", \"gpt-image-2-hd\"], \"max_budget\": ${MAX_BUDGET:-25}, \"budget_duration\": \"1mo\"}" 2>/dev/null)
+    -d "{\"key_alias\": \"${CUSTOMER_ID:-custodian}\", \"models\": [\"deepseek-v4-pro\", \"dashscope-vision\", \"gpt-image-2-hd\"], \"max_budget\": ${MAX_BUDGET:-25}, \"budget_duration\": \"1mo\"}" 2>/dev/null)
   _RAW_KEY=$(echo "$KEY_RESPONSE" | grep -o '"key":"[^"]*"' | head -1 | cut -d'"' -f4)
   if [ -z "${_RAW_KEY}" ]; then
     echo "ERROR: Failed to auto-generate API key. Response:"
