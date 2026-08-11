@@ -31,7 +31,7 @@ services:
       - BUDGET_PROXY_URL=${BUDGET_PROXY_URL:-https://budget.ns1net.com/v1}
       - TZ=${TZ:-America/Chicago}
       - SEARXNG_URL=http://searxng:8080
-      - API_SERVER_MODEL_NAME=Custodian
+      - API_SERVER_MODEL_NAME=hermes-backend
 
     volumes:
       - ./hermes-data:/opt/data

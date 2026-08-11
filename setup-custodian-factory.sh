@@ -557,6 +557,41 @@ else
   log_warn "Output: $STEP5D_OUTPUT"
 fi
 
+log_step 'Step 5d2: Delete Stale API-Fetched Models'
+# When Hermes advertises a model via /v1/models (API_SERVER_MODEL_NAME),
+# OpenWebUI auto-creates a duplicate model entry with base_model_id=NULL.
+# This model inherits ALL of Hermes' capabilities (terminal, code_exec, etc.)
+# and confuses users. Delete it. Only the workspace model should exist.
+cat > /tmp/delete_api_models.py << 'PYEOF'
+import sqlite3
+conn = sqlite3.connect('/app/backend/data/webui.db')
+# API-fetched models: base_model_id IS NULL, user_id is a real user UUID
+rows = conn.execute(
+    "SELECT id, name, user_id FROM model WHERE name=? AND base_model_id IS NULL",
+    ("Custodian",)
+).fetchall()
+for row in rows:
+    conn.execute("DELETE FROM model WHERE id=?", (row[0],))
+    print(f"DELETED API-fetched model: {row[1]} (id={row[0][:8]}..., user={row[2]})")
+conn.commit()
+if not rows:
+    print("NONE_FOUND")
+conn.close()
+PYEOF
+
+docker cp /tmp/delete_api_models.py "$WEBUI_CONTAINER":/tmp/
+STEP5D2_OUTPUT=$(docker exec "$WEBUI_CONTAINER" python3 /tmp/delete_api_models.py 2>&1)
+docker exec "$WEBUI_CONTAINER" rm /tmp/delete_api_models.py 2>/dev/null || true
+rm /tmp/delete_api_models.py
+
+if echo "$STEP5D2_OUTPUT" | grep -q 'DELETED'; then
+  log_ok "Deleted stale API-fetched model(s) — only workspace model remains"
+elif echo "$STEP5D2_OUTPUT" | grep -q 'NONE_FOUND'; then
+  log_ok "No stale API-fetched models found"
+else
+  log_warn "API model cleanup: $STEP5D2_OUTPUT"
+fi
+
 log_step 'Step 5e: Register Vision Model + LiteLLM Routing'
 
 # Bug #57: Vision Router filter routes to dashscope-vision but OpenWebUI
