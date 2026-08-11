@@ -10,7 +10,16 @@
 
 set -euo pipefail
 
-WEBUI_CONTAINER="custodian-webui"
+# Auto-detect WebUI container (supports any CUSTOMER_ID: admin-webui, custodian-webui, etc.)
+WEBUI_CONTAINER=$(docker ps --format '{{.Names}}' 2>/dev/null | grep '\-webui$' | head -1)
+if [ -z "$WEBUI_CONTAINER" ]; then
+    echo "ERROR: No WebUI container found (looking for *-webui)"
+    echo "Running containers:"
+    docker ps --format '  - {{.Names}}' 2>/dev/null || echo "  (Docker not accessible)"
+    exit 1
+fi
+echo "Found WebUI container: $WEBUI_CONTAINER"
+
 WEBUI_PORT="${WEBUI_PORT:-3000}"
 
 echo "=== Fix Dell: Custodian Models + Image Generation ==="
