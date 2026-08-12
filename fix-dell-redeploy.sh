@@ -78,6 +78,15 @@ cd /home/custodian
 curl -sS -o docker-compose.custodian-factory.yml "$COMPOSE_URL"
 echo "Compose downloaded"
 
+# 4b. Remove old/stale WebUI containers that hold port 3000
+#    (e.g. da6b10f9c2d6_admin-webui from earlier manual starts)
+echo ""
+echo "Removing stale WebUI containers..."
+for OLD in $(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -i 'webui' | grep -v '^admin-webui$'); do
+    echo "  Removing stale container: $OLD"
+    docker rm -f "$OLD" 2>/dev/null || echo "  (already gone)"
+done
+
 # 5. Re-create containers with correct env (survives restarts)
 echo ""
 echo "Re-deploying with corrected compose..."
