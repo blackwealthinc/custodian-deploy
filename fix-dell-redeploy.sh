@@ -72,10 +72,10 @@ if [ -z "$WEBUI_KEY" ]; then
 fi
 echo "CUST_KEY: ${CUST_KEY:0:8}..."
 
-# 4. Download the corrected compose
+# 4. Download the corrected compose (with cache-buster to avoid CDN staleness)
 mkdir -p /home/custodian
 cd /home/custodian
-curl -sS -o docker-compose.custodian-factory.yml "$COMPOSE_URL"
+curl -sS -o docker-compose.custodian-factory.yml "${COMPOSE_URL}?$(date +%s)"
 echo "Compose downloaded"
 
 # 4b. Remove old/stale WebUI containers that hold port 3000
@@ -96,7 +96,7 @@ CUSTOMER_ID="admin" \
   CUSTOMER_API_KEY="$CUST_KEY" \
   BUDGET_PROXY_URL="http://100.64.0.1:4000/v1" \
   PORT="8642" WEBUI_PORT="3000" \
-  docker compose -p admin -f docker-compose.custodian-factory.yml up -d 2>&1
+  docker compose -p admin -f docker-compose.custodian-factory.yml up -d --force-recreate 2>&1
 
 # 6. Wait for WebUI
 echo ""
