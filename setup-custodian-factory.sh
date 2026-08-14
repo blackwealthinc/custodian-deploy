@@ -599,7 +599,7 @@ log_step 'Step 5e: Register Vision Model + LiteLLM Routing'
 # model AND must route directly to LiteLLM (bypassing Hermes, which overrides
 # all model names to deepseek-v4-pro).
 cat > /tmp/inject_vision_model.py << 'PYEOF'
-import sqlite3, json, time
+import sqlite3, json, time, os
 
 conn = sqlite3.connect('/app/backend/data/webui.db')
 now = int(time.time())

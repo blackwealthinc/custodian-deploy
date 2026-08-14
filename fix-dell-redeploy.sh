@@ -1,22 +1,21 @@
 #!/bin/bash
-# fix-dell-redeploy.sh (v2 — auto-detects data directory)
-# Run ON THE DELL (192.168.50.250).
+# fix-dell-redeploy.sh (v3 — complete Dell fix: redeploy + model routing + cleanup + warning)
+# Run ON THE DELL (192.168.50.250) as root.
 #
-# Re-deploys the Dell with the corrected docker-compose from GitHub.
+# One-liner:
+#   curl -s https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/fix-dell-redeploy.sh | sudo bash
 #
-# Fixes:
-#   Bug #90: API_SERVER_MODEL_NAME=hermes-backend (no duplicate Custodian)
-#   Bug #91: image generation routed to LiteLLM (gpt-image-2-hd)
-#   Bug #92: RAG_FILE_MAX_SIZE=10000 (10GB upload cap)
-#   Bug #93: ENABLE_PERSISTENT_CONFIG=false (env vars win over stale DB)
-#   Bug #94: auto-detect data dir (was hardcoded /home/custodian → data loss)
+# Fixes (all verified against live Dell 2026-08-13):
+#   Bug #95: OPENAI_API_BASE_URL (singular) dropped LiteLLM -> plural OPENAI_API_BASE_URLS/KEYS
+#   Bug #96: cleanup timer pointed at /home/custodian (empty) -> /data/webui-data (real)
+#   Bug #97: "Custodian" base_model_id='Custodian' dangling -> 'hermes-backend'
+#   Bug #99: RAG_FILE_MAX_SIZE=10000 (10GB/file) -> 100 (100MB/file) + 10GB TOTAL cap
+#   Step 5g: Image Deletion Warning filter (3-day auto-delete notice)
 #
 # WHY auto-detect (Bug #94 fix):
-#   The original deployment used CUSTODIAN_HOME=/data, so the compose's
-#   relative volume ./webui-data resolved to /data/webui-data. Earlier fix
-#   scripts hardcoded cd /home/custodian, silently switching the container
-#   to a fresh empty DB. We now SCAN for the real webui.db and use its dir.
-#
+#   Original deployment used CUSTODIAN_HOME=/data, so the compose's relative
+#   volume ./webui-data resolves to /data/webui-data. Earlier scripts hardcoded
+#   cd /home/custodian, silently switching to a fresh empty DB.
 #   Source: https://docs.docker.com/compose/compose-file/05-services/#volumes
 #   "Relative paths are resolved from the directory containing the Compose file."
 
@@ -24,16 +23,16 @@ set -euo pipefail
 
 COMPOSE_URL="https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/docker-compose.custodian-factory.yml"
 
-echo "=== Fix Dell: Re-deploy (v2 — auto-detect data dir) ==="
+echo "=== Fix Dell: Redeploy + model routing + cleanup (v3) ==="
 
-# 1. Find existing containers (for key extraction, BEFORE recreation)
+# ── 1. Find existing containers (for key extraction, BEFORE recreation) ──
 HERMES_CONTAINER=$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep '\-hermes$' | grep -v '^custodian-' | head -1)
 WEBUI_CONTAINER=$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep '\-webui$' | grep -v '^custodian-' | head -1)
 if [ -z "$WEBUI_CONTAINER" ]; then WEBUI_CONTAINER=$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep 'webui' | head -1); fi
 if [ -z "$HERMES_CONTAINER" ]; then HERMES_CONTAINER=$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep 'hermes' | head -1); fi
 echo "Found: Hermes=$HERMES_CONTAINER  WebUI=$WEBUI_CONTAINER"
 
-# 2. Extract existing keys (do NOT regenerate)
+# ── 2. Extract existing keys (do NOT regenerate — preserves sessions + auth) ──
 API_SERVER_KEY=$(docker inspect "$HERMES_CONTAINER" --format '{{range .Config.Env}}{{if eq (index (split . "=") 0) "API_SERVER_KEY"}}{{index (split . "=") 1}}{{end}}{{end}}' 2>/dev/null)
 if [ -z "$API_SERVER_KEY" ]; then
     API_SERVER_KEY=$(docker exec "$WEBUI_CONTAINER" python3 -c "
@@ -50,13 +49,16 @@ if [ -z "$API_SERVER_KEY" ]; then echo "ERROR: no API_SERVER_KEY"; exit 1; fi
 echo "API_SERVER_KEY: ${API_SERVER_KEY:0:8}..."
 
 CUST_KEY=$(docker inspect "$WEBUI_CONTAINER" --format '{{range .Config.Env}}{{if eq (index (split . "=") 0) "IMAGES_OPENAI_API_KEY"}}{{index (split . "=") 1}}{{end}}{{end}}' 2>/dev/null)
+# Fallback: Hermes container's OPENAI_API_KEY = ${CUSTOMER_API_KEY} (same key)
+if [ -z "$CUST_KEY" ]; then
+    CUST_KEY=$(docker inspect "$HERMES_CONTAINER" --format '{{range .Config.Env}}{{if eq (index (split . "=") 0) "OPENAI_API_KEY"}}{{index (split . "=") 1}}{{end}}{{end}}' 2>/dev/null)
+fi
 WEBUI_KEY=$(docker inspect "$WEBUI_CONTAINER" --format '{{range .Config.Env}}{{if eq (index (split . "=") 0) "WEBUI_SECRET_KEY"}}{{index (split . "=") 1}}{{end}}{{end}}' 2>/dev/null)
 if [ -z "$CUST_KEY" ]; then echo "ERROR: no CUSTOMER_API_KEY"; exit 1; fi
 if [ -z "$WEBUI_KEY" ]; then echo "WARN: no WEBUI_SECRET_KEY, generating new (users re-login)"; WEBUI_KEY=$(openssl rand -hex 32); fi
 echo "CUST_KEY: ${CUST_KEY:0:8}..."
 
-# 3. AUTO-DETECT the real data directory (Bug #94 fix)
-#    Scan common locations; pick the webui.db with the most models.
+# ── 3. AUTO-DETECT the real data directory (Bug #94 fix) ──
 CUSTODIAN_HOME=""
 MAX_MODELS=-1
 for DIR in /data /home/custodian /home/admin /opt/custodian; do
@@ -64,33 +66,36 @@ for DIR in /data /home/custodian /home/admin /opt/custodian; do
     if [ -f "$DB" ]; then
         COUNT=$(python3 -c "import sqlite3; c=sqlite3.connect('$DB'); print(c.execute('SELECT COUNT(*) FROM model').fetchone()[0]); c.close()" 2>/dev/null || echo "0")
         COUNT=${COUNT:-0}
-        echo "  scan: $DIR/webui-data/webui.db → models=$COUNT"
+        echo "  scan: $DIR/webui-data/webui.db -> models=$COUNT"
         if [ "$COUNT" -gt "$MAX_MODELS" ] 2>/dev/null; then
             MAX_MODELS="$COUNT"
             CUSTODIAN_HOME="$DIR"
         fi
     fi
 done
-
 if [ -z "$CUSTODIAN_HOME" ]; then
     echo "ERROR: could not find an existing webui.db. Aborting (refusing to create empty)."
     exit 1
 fi
 echo "Using data directory: $CUSTODIAN_HOME (models=$MAX_MODELS)"
 
-# 4. Download the corrected compose INTO the data directory
+# ── 4. Download the corrected compose INTO the data directory ──
 cd "$CUSTODIAN_HOME"
 curl -sS -o docker-compose.custodian-factory.yml "${COMPOSE_URL}?$(date +%s)"
 echo "Compose downloaded to $CUSTODIAN_HOME"
 
-# 5. Remove stale WebUI containers holding port 3000
-echo "Removing stale WebUI containers..."
-for OLD in $(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -i 'webui' | grep -v '^admin-webui$'); do
-    echo "  Removing: $OLD"
+# ── 5. Remove stale containers (webui holding port 3000 + orphaned hermes) ──
+echo "Removing stale containers..."
+for OLD in $(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -i 'webui' | grep -v "^${WEBUI_CONTAINER}$"); do
+    echo "  Removing webui: $OLD"
+    docker rm -f "$OLD" 2>/dev/null || echo "  (already gone)"
+done
+for OLD in $(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -i 'hermes' | grep -v "^${HERMES_CONTAINER}$"); do
+    echo "  Removing hermes: $OLD"
     docker rm -f "$OLD" 2>/dev/null || echo "  (already gone)"
 done
 
-# 6. Re-create containers with correct env + correct volume path
+# ── 6. Re-create containers with correct env + correct volume path ──
 echo "Re-deploying..."
 CUSTOMER_ID="admin" \
   API_SERVER_KEY="$API_SERVER_KEY" \
@@ -100,7 +105,7 @@ CUSTOMER_ID="admin" \
   PORT="8642" WEBUI_PORT="3000" \
   docker compose -p admin -f docker-compose.custodian-factory.yml up -d --force-recreate 2>&1
 
-# 7. Wait for WebUI
+# ── 7. Wait for WebUI ──
 echo "Waiting for WebUI..."
 for i in $(seq 1 30); do
     CODE=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3000 2>/dev/null || echo 000)
@@ -108,9 +113,20 @@ for i in $(seq 1 30); do
     sleep 3
 done
 
-# 8. Clean up any API-fetched duplicate (base_model_id IS NULL)
+# ── 8. Fix dangling base_model_id (Bug #97) ──
+echo "Fixing Custodian base_model_id -> hermes-backend..."
+docker exec "$WEBUI_CONTAINER" python3 -c "
+import sqlite3
+c = sqlite3.connect('/app/backend/data/webui.db')
+n = c.execute(\"UPDATE model SET base_model_id='hermes-backend' WHERE name='Custodian' AND base_model_id='Custodian'\").rowcount
+c.commit()
+print(f'FIXED base_model_id: {n} row(s)')
+c.close()
+" 2>&1
+
+# ── 9. Clean up API-fetched duplicate "Custodian" (base_model_id IS NULL) ──
 echo "Cleaning API-fetched models..."
-docker exec admin-webui python3 -c "
+docker exec "$WEBUI_CONTAINER" python3 -c "
 import sqlite3
 c = sqlite3.connect('/app/backend/data/webui.db')
 rows = c.execute(\"SELECT id, name FROM model WHERE name='Custodian' AND base_model_id IS NULL\").fetchall()
@@ -122,22 +138,154 @@ if not rows: print('CLEAN')
 c.close()
 " 2>&1
 
-# 9. Verify
+# ── 10. Install cleanup script + timer (Bug #96 + #99: correct path + 10GB cap) ──
+echo "Installing cleanup script + timer..."
+cat > /usr/local/bin/custodian-cleanup.sh << 'SCRIPTEOF'
+#!/bin/bash
+set -uo pipefail
+
+# Auto-detect the data dir (never hardcode — Bug #94/#96 lesson)
+UPLOADS_DIR="${CUSTODIAN_DATA_DIR:-/data/webui-data}/uploads"
+[ -d "$UPLOADS_DIR" ] || exit 0
+
+MAX_BYTES=$((10 * 1024 * 1024 * 1024))   # 10 GB total
+
+# 1) generated images older than 3 days
+find "$UPLOADS_DIR" -name '*_generated-image.*' -mtime +3 -delete 2>/dev/null || true
+
+# 2) other uploads older than 30 days
+find "$UPLOADS_DIR" ! -name '*_generated-image.*' -mtime +30 -delete 2>/dev/null || true
+
+# 3) enforce 10 GB total — delete oldest first until under cap
+total=$(du -sb "$UPLOADS_DIR" 2>/dev/null | awk '{print $1}')
+total=${total:-0}
+if [ "$total" -gt "$MAX_BYTES" ]; then
+  find "$UPLOADS_DIR" -type f -printf '%T@ %p\n' 2>/dev/null \
+    | sort -n \
+    | while IFS=' ' read -r _ f; do
+        [ -n "$f" ] || continue
+        [ -f "$f" ] || continue
+        sz=$(stat -c %s "$f" 2>/dev/null || echo 0)
+        rm -f "$f" 2>/dev/null || true
+        total=$((total - sz))
+        if [ "$total" -le "$MAX_BYTES" ]; then break; fi
+      done
+fi
+SCRIPTEOF
+chmod +x /usr/local/bin/custodian-cleanup.sh
+
+cat > /etc/systemd/system/custodian-cleanup.service << UNITEOF
+[Unit]
+Description=Custodian — cleanup old images/uploads + enforce 10 GB cap
+[Service]
+Type=oneshot
+Environment=CUSTODIAN_DATA_DIR=${CUSTODIAN_HOME}/webui-data
+ExecStart=/usr/local/bin/custodian-cleanup.sh
+UNITEOF
+
+cat > /etc/systemd/system/custodian-cleanup.timer << 'UNITEOF'
+[Unit]
+Description=Hourly Custodian cleanup
+[Timer]
+OnCalendar=hourly
+Persistent=true
+[Install]
+WantedBy=timers.target
+UNITEOF
+
+systemctl daemon-reload
+systemctl enable --now custodian-cleanup.timer
+echo "Cleanup timer installed (target: ${CUSTODIAN_HOME}/webui-data/uploads)"
+
+# ── 11. Install Image Deletion Warning filter (Step 5g) ──
+echo "Installing Image Deletion Warning filter..."
+cat > /tmp/inject_image_warning.py << 'PYEOF'
+import sqlite3, json, uuid, time
+conn = sqlite3.connect('/app/backend/data/webui.db')
+now = int(time.time())
+
+source = '''"""
+title: Image Deletion Warning
+author: Custodian
+description: Warns that generated images are auto-deleted after 3 days.
+version: 1.0.0
+"""
+from pydantic import BaseModel, Field
+from typing import Optional
+
+class Filter:
+    class Valves(BaseModel):
+        priority: int = Field(default=0)
+
+    def __init__(self):
+        self.valves = self.Valves()
+
+    async def inlet(self, body: dict, __user__: Optional[dict] = None, __event_emitter__=None) -> dict:
+        model = body.get("model", "")
+        if model in {"374e596f-9137-584f-a75a-b770059dee2e", "gpt-image-2-hd"} and __event_emitter__:
+            await __event_emitter__({
+                "type": "status",
+                "data": {"description": "Images are auto-deleted after 3 days — save important images locally.", "done": True}
+            })
+        return body
+'''
+
+meta = json.dumps({"description": "Warns that generated images are deleted after 3 days.",
+                   "manifest": {"name": "Image Deletion Warning", "version": "1.0.0"}})
+valves = json.dumps({})
+func_id = str(uuid.uuid4())
+
+existing = conn.execute("SELECT id FROM function WHERE name='Image Deletion Warning' AND type='filter'").fetchone()
+if existing:
+    conn.execute("UPDATE function SET content=?, meta=?, updated_at=? WHERE id=?", (source, meta, now, existing[0]))
+else:
+    conn.execute("INSERT INTO function (id, user_id, name, type, content, meta, valves, is_active, is_global, updated_at, created_at) VALUES (?, NULL, ?, 'filter', ?, ?, ?, TRUE, TRUE, ?, ?)",
+        (func_id, 'Image Deletion Warning', source, meta, valves, now, now))
+conn.commit(); conn.close()
+print("OK")
+PYEOF
+
+docker cp /tmp/inject_image_warning.py "$WEBUI_CONTAINER":/tmp/
+docker exec "$WEBUI_CONTAINER" python3 /tmp/inject_image_warning.py 2>&1
+docker exec "$WEBUI_CONTAINER" rm /tmp/inject_image_warning.py 2>/dev/null || true
+rm /tmp/inject_image_warning.py
+
+# ── 12. Restart WebUI once to reload models + filters ──
+echo "Restarting WebUI to reload models + filters..."
+docker restart "$WEBUI_CONTAINER" >/dev/null 2>&1
+for i in $(seq 1 30); do
+    CODE=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3000 2>/dev/null || echo 000)
+    if [ "$CODE" = "200" ] || [ "$CODE" = "302" ]; then echo "WebUI restarted ($CODE)"; break; fi
+    sleep 2
+done
+
+# ── 13. Verify ──
 echo ""
 echo "=== VERIFY ==="
 echo "Data dir: $CUSTODIAN_HOME"
 echo "Models:"
-docker exec admin-webui python3 -c "
+docker exec "$WEBUI_CONTAINER" python3 -c "
 import sqlite3
 c = sqlite3.connect('/app/backend/data/webui.db')
 for r in c.execute('SELECT name, base_model_id FROM model ORDER BY name').fetchall():
-    print(f'  {r[0]} base={r[1]}')
-print(f'Total chats:', c.execute('SELECT COUNT(*) FROM chat').fetchone()[0])
+    print(f'  {r[0]:20s} base={r[1] or \"NULL\"}')
+print(f'Chats:', c.execute('SELECT COUNT(*) FROM chat').fetchone()[0])
 c.close()
 " 2>&1
-echo "ENABLE_PERSISTENT_CONFIG:"
-docker exec admin-webui printenv ENABLE_PERSISTENT_CONFIG 2>&1
-echo "API_SERVER_MODEL_NAME:"
-docker inspect admin-hermes --format '{{range .Config.Env}}{{if eq (index (split . "=") 0) "API_SERVER_MODEL_NAME"}}{{println .}}{{end}}{{end}}' 2>/dev/null
+echo "Functions (filters):"
+docker exec "$WEBUI_CONTAINER" python3 -c "
+import sqlite3
+c = sqlite3.connect('/app/backend/data/webui.db')
+for r in c.execute('SELECT name, type, is_active FROM function').fetchall():
+    print(f'  {r[0]} ({r[1]}) active={r[2]}')
+c.close()
+" 2>&1
+echo "Env (must be PLURAL + RAG 100):"
+docker exec "$WEBUI_CONTAINER" printenv OPENAI_API_BASE_URLS 2>&1
+docker exec "$WEBUI_CONTAINER" printenv OPENAI_API_KEYS 2>&1 | sed -E 's/(sk-|b72).*/REDACTED/'
+docker exec "$WEBUI_CONTAINER" printenv RAG_FILE_MAX_SIZE 2>&1
+echo "Cleanup timer:"
+systemctl is-enabled custodian-cleanup.timer 2>&1
+systemctl is-active custodian-cleanup.timer 2>&1
 echo ""
 echo "=== DONE ==="

@@ -63,22 +63,22 @@ if workspace:
     old_meta = json.loads(workspace[1]) if workspace[1] else {}
     old_caps = old_meta.get('capabilities', {})
     if old_caps.get('image_generation'):
-        conn.execute("UPDATE model SET meta=?, updated_at=? WHERE id=?",
-            (custodian_meta, now, workspace[0]))
+        conn.execute("UPDATE model SET base_model_id=?, meta=?, updated_at=? WHERE id=?",
+            ('hermes-backend', custodian_meta, now, workspace[0]))
         changes.append("REMOVED image_generation from Custodian workspace model")
         print("FIXED: Removed image_generation from Custodian (image-only model is 'Custodian Images')")
     else:
-        # Still update to ensure description is current
-        conn.execute("UPDATE model SET meta=?, updated_at=? WHERE id=?",
-            (custodian_meta, now, workspace[0]))
+        # Still update base + meta to ensure routing is current (Bug #97: hermes-backend)
+        conn.execute("UPDATE model SET base_model_id=?, meta=?, updated_at=? WHERE id=?",
+            ('hermes-backend', custodian_meta, now, workspace[0]))
         print("OK: Custodian model already clean")
 else:
-    # Create it
+    # Create it (Bug #97: base_model_id must be hermes-backend, not 'Custodian')
     model_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, 'custodian-model'))
     conn.execute(
         "INSERT INTO model (id, user_id, base_model_id, name, params, meta, is_active, created_at, updated_at) "
         "VALUES (?, ?, ?, ?, ?, ?, TRUE, ?, ?)",
-        (model_id, '', 'Custodian', 'Custodian', '{}', custodian_meta, now, now))
+        (model_id, '', 'hermes-backend', 'Custodian', '{}', custodian_meta, now, now))
     changes.append("CREATED Custodian workspace model")
     print("CREATED: Custodian workspace model")
 
