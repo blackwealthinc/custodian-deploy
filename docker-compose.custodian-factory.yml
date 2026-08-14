@@ -56,8 +56,8 @@ services:
     restart: unless-stopped
 
     environment:
-      - OPENAI_API_BASE_URL=http://hermes:8642/v1
-      - OPENAI_API_KEY=${API_SERVER_KEY}
+      - OPENAI_API_BASE_URLS=http://hermes:8642/v1;http://100.64.0.1:4000/v1
+      - OPENAI_API_KEYS=${API_SERVER_KEY};${CUSTOMER_API_KEY}
       - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY}
       - TZ=${TZ:-America/Chicago}
       # Force env vars to win over DB (prevents stale config overriding correct values)
@@ -75,7 +75,7 @@ services:
       - IMAGES_OPENAI_API_BASE_URL=http://100.64.0.1:4000/v1
       - IMAGES_OPENAI_API_KEY=${CUSTOMER_API_KEY}
       # Upload limits
-      - RAG_FILE_MAX_SIZE=10000
+      - RAG_FILE_MAX_SIZE=100
       - RAG_FILE_MAX_COUNT=10
 
     volumes:

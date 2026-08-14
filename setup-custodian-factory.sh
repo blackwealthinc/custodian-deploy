@@ -314,17 +314,6 @@ import sqlite3, json, uuid, time
 
 conn = sqlite3.connect('/app/backend/data/webui.db')
 
-# Bug #49: UPSERT — update existing filter with latest content instead of skipping
-now = int(time.time())
-existing = conn.execute("SELECT id FROM function WHERE name='Deep Research' AND type='filter'").fetchone()
-if existing:
-    conn.execute('UPDATE function SET content=?, meta=?, updated_at=? WHERE id=?',
-        (source, meta, now, existing[0]))
-    conn.commit()
-    conn.close()
-    print('UPDATED')
-    exit(0)
-
 source = '''"""
 title: Deep Research
 author: Custodian
@@ -435,6 +424,17 @@ meta = json.dumps({
     }
 })
 
+# Bug #49: UPSERT — update existing filter with latest content instead of skipping
+now = int(time.time())
+existing = conn.execute("SELECT id FROM function WHERE name='Deep Research' AND type='filter'").fetchone()
+if existing:
+    conn.execute('UPDATE function SET content=?, meta=?, updated_at=? WHERE id=?',
+        (source, meta, now, existing[0]))
+    conn.commit()
+    conn.close()
+    print('UPDATED')
+    exit(0)
+
 valves = json.dumps({})
 now = int(time.time())
 func_id = str(uuid.uuid4())
@@ -489,14 +489,14 @@ meta = json.dumps({
 # UPSERT Custodian model
 existing = conn.execute("SELECT id FROM model WHERE name='Custodian'").fetchone()
 if existing:
-    conn.execute('UPDATE model SET meta=?, updated_at=? WHERE id=?',
-        (meta, now, existing[0]))
+    conn.execute('UPDATE model SET base_model_id=?, meta=?, updated_at=? WHERE id=?',
+        ('hermes-backend', meta, now, existing[0]))
     was_update = True
 else:
     model_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, 'custodian-model'))
     conn.execute('''INSERT INTO model (id, user_id, base_model_id, name, params, meta, is_active, created_at, updated_at)
 VALUES (?, ?, ?, ?, ?, ?, TRUE, ?, ?)''',
-        (model_id, '', 'Custodian', 'Custodian', json.dumps({}), meta, now, now))
+        (model_id, '', 'hermes-backend', 'Custodian', json.dumps({}), meta, now, now))
     was_update = False
 
 # UPSERT Custodian Images model (Bug #84 fix — now runs on re-runs too)
@@ -634,31 +634,6 @@ if liteLLM_url not in urls:
         (json.dumps(keys), "openai.api_keys"))
     changes += 1
 
-# Set per-model routing: dashscope-vision -> LiteLLM directly
-api_cfgs = configs.get("openai.api_configs", {})
-if "dashscope-vision" not in api_cfgs:
-    api_cfgs["dashscope-vision"] = {
-        "api_base_url": liteLLM_url,
-        "api_key": liteLLM_key
-    }
-    conn.execute("UPDATE config SET value=? WHERE key=?",
-        (json.dumps(api_cfgs), "openai.api_configs"))
-    changes += 1
-
-# Set per-model routing: gpt-image-2-hd -> LiteLLM directly (reuse same connection)
-# Same URL, same key — different model, same budget pool
-api_cfgs = json.loads(conn.execute(
-    "SELECT value FROM config WHERE key='openai.api_configs'"
-).fetchone()[0])
-if "gpt-image-2-hd" not in api_cfgs:
-    api_cfgs["gpt-image-2-hd"] = {
-        "api_base_url": liteLLM_url,
-        "api_key": liteLLM_key
-    }
-    conn.execute("UPDATE config SET value=? WHERE key=?",
-        (json.dumps(api_cfgs), "openai.api_configs"))
-    changes += 1
-
 # Bug #76: Inject image_generation DB config — env vars are silently overridden
 # OpenWebUI's ENABLE_PERSISTENT_CONFIG=True (default) makes DB values authoritative
 # Without this, correct env vars are ignored and image generation stays disabled
@@ -775,33 +750,123 @@ else
   log_info "PullMD not deployed — web extraction unavailable (optional)"
 fi
 
-log_step 'Step 5f: Image Cleanup Timer'
+log_step 'Step 5f: Image Cleanup Timer + 10 GB Cap'
+
+cat > /usr/local/bin/custodian-cleanup.sh << 'SCRIPTEOF'
+#!/bin/bash
+set -uo pipefail
+
+# Auto-detect the data dir (same pattern as fix-dell-redeploy.sh — never hardcode)
+UPLOADS_DIR="${CUSTODIAN_DATA_DIR:-/data/webui-data}/uploads"
+[ -d "$UPLOADS_DIR" ] || exit 0
+
+MAX_BYTES=$((10 * 1024 * 1024 * 1024))   # 10 GB total
+
+# 1) generated images older than 3 days
+find "$UPLOADS_DIR" -name '*_generated-image.*' -mtime +3 -delete 2>/dev/null || true
+
+# 2) other uploads older than 30 days
+find "$UPLOADS_DIR" ! -name '*_generated-image.*' -mtime +30 -delete 2>/dev/null || true
+
+# 3) enforce 10 GB total — delete oldest first until under cap
+total=$(du -sb "$UPLOADS_DIR" 2>/dev/null | awk '{print $1}')
+total=${total:-0}
+if [ "$total" -gt "$MAX_BYTES" ]; then
+  find "$UPLOADS_DIR" -type f -printf '%T@ %p\n' 2>/dev/null \
+    | sort -n \
+    | while IFS=' ' read -r _ f; do
+        [ -n "$f" ] || continue
+        [ -f "$f" ] || continue
+        sz=$(stat -c %s "$f" 2>/dev/null || echo 0)
+        rm -f "$f" 2>/dev/null || true
+        total=$((total - sz))
+        if [ "$total" -le "$MAX_BYTES" ]; then break; fi
+      done
+fi
+SCRIPTEOF
+chmod +x /usr/local/bin/custodian-cleanup.sh
 
 cat > /etc/systemd/system/custodian-cleanup.service << 'UNITEOF'
 [Unit]
-Description=Custodian — Delete old generated images and uploads
-
+Description=Custodian — cleanup old images/uploads + enforce 10 GB cap
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/find /home/custodian/webui-data/uploads -name "*_generated-image.*" -mtime +3 -delete
+ExecStart=/usr/local/bin/custodian-cleanup.sh
 UNITEOF
 
 cat > /etc/systemd/system/custodian-cleanup.timer << 'UNITEOF'
 [Unit]
-Description=Daily cleanup of old Custodian images and uploads
-
+Description=Hourly Custodian cleanup
 [Timer]
-OnCalendar=daily
+OnCalendar=hourly
 Persistent=true
-
 [Install]
 WantedBy=timers.target
 UNITEOF
 
 systemctl daemon-reload
 systemctl enable --now custodian-cleanup.timer
-log_ok 'Cleanup timer active (generated images: 3 days)'
+log_ok 'Cleanup timer active (generated images: 3 days, uploads: 30 days, 10 GB total cap)'
 
+log_step 'Step 5g: Image Deletion Warning Filter'
+
+cat > /tmp/inject_image_warning.py << 'PYEOF'
+import sqlite3, json, uuid, time
+conn = sqlite3.connect('/app/backend/data/webui.db')
+now = int(time.time())
+
+source = '''"""
+title: Image Deletion Warning
+author: Custodian
+description: Warns that generated images are auto-deleted after 3 days.
+version: 1.0.0
+"""
+from pydantic import BaseModel, Field
+from typing import Optional
+
+class Filter:
+    class Valves(BaseModel):
+        priority: int = Field(default=0)
+
+    def __init__(self):
+        self.valves = self.Valves()
+
+    async def inlet(self, body: dict, __user__: Optional[dict] = None, __event_emitter__=None) -> dict:
+        model = body.get("model", "")
+        if model in {"374e596f-9137-584f-a75a-b770059dee2e", "gpt-image-2-hd"} and __event_emitter__:
+            await __event_emitter__({
+                "type": "status",
+                "data": {"description": "Images are auto-deleted after 3 days — save important images locally.", "done": True}
+            })
+        return body
+'''
+
+meta = json.dumps({"description": "Warns that generated images are deleted after 3 days.",
+                   "manifest": {"name": "Image Deletion Warning", "version": "1.0.0"}})
+valves = json.dumps({})
+func_id = str(uuid.uuid4())
+
+existing = conn.execute("SELECT id FROM function WHERE name='Image Deletion Warning' AND type='filter'").fetchone()
+if existing:
+    conn.execute("UPDATE function SET content=?, meta=?, updated_at=? WHERE id=?", (source, meta, now, existing[0]))
+else:
+    conn.execute("INSERT INTO function (id, user_id, name, type, content, meta, valves, is_active, is_global, updated_at, created_at) VALUES (?, NULL, ?, 'filter', ?, ?, ?, TRUE, TRUE, ?, ?)",
+        (func_id, 'Image Deletion Warning', source, meta, valves, now, now))
+conn.commit(); conn.close()
+print("OK")
+PYEOF
+
+docker cp /tmp/inject_image_warning.py "$WEBUI_CONTAINER":/tmp/
+STEP5G_OUTPUT=$(docker exec "$WEBUI_CONTAINER" python3 /tmp/inject_image_warning.py 2>&1)
+docker exec "$WEBUI_CONTAINER" rm /tmp/inject_image_warning.py 2>/dev/null || true
+rm /tmp/inject_image_warning.py
+
+if echo "$STEP5G_OUTPUT" | grep -q 'OK'; then
+  log_ok "Image Deletion Warning filter installed"
+  docker restart "$WEBUI_CONTAINER" >/dev/null 2>&1
+else
+  log_warn "Image Deletion Warning filter install failed (non-fatal): $STEP5G_OUTPUT"
+fi
 echo ''
 echo '=== CUSTODIAN — READY ==='
 echo "  Open WebUI:  http://${SERVER_IP}:${WEBUI_PORT:-3000}"
