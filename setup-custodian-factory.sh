@@ -808,65 +808,6 @@ systemctl daemon-reload
 systemctl enable --now custodian-cleanup.timer
 log_ok 'Cleanup timer active (generated images: 3 days, uploads: 30 days, 10 GB total cap)'
 
-log_step 'Step 5g: Image Deletion Warning Filter'
-
-cat > /tmp/inject_image_warning.py << 'PYEOF'
-import sqlite3, json, uuid, time
-conn = sqlite3.connect('/app/backend/data/webui.db')
-now = int(time.time())
-
-source = '''"""
-title: Image Deletion Warning
-author: Custodian
-description: Warns that generated images are auto-deleted after 3 days.
-version: 1.0.0
-"""
-from pydantic import BaseModel, Field
-from typing import Optional
-
-class Filter:
-    class Valves(BaseModel):
-        priority: int = Field(default=0)
-
-    def __init__(self):
-        self.valves = self.Valves()
-
-    async def inlet(self, body: dict, __user__: Optional[dict] = None, __event_emitter__=None) -> dict:
-        model = body.get("model", "")
-        if model in {"374e596f-9137-584f-a75a-b770059dee2e", "gpt-image-2-hd"} and __event_emitter__:
-            await __event_emitter__({
-                "type": "status",
-                "data": {"description": "Images are auto-deleted after 3 days — save important images locally.", "done": True}
-            })
-        return body
-'''
-
-meta = json.dumps({"description": "Warns that generated images are deleted after 3 days.",
-                   "manifest": {"name": "Image Deletion Warning", "version": "1.0.0"}})
-valves = json.dumps({})
-func_id = str(uuid.uuid4())
-
-existing = conn.execute("SELECT id FROM function WHERE name='Image Deletion Warning' AND type='filter'").fetchone()
-if existing:
-    conn.execute("UPDATE function SET content=?, meta=?, updated_at=? WHERE id=?", (source, meta, now, existing[0]))
-else:
-    conn.execute("INSERT INTO function (id, user_id, name, type, content, meta, valves, is_active, is_global, updated_at, created_at) VALUES (?, NULL, ?, 'filter', ?, ?, ?, TRUE, TRUE, ?, ?)",
-        (func_id, 'Image Deletion Warning', source, meta, valves, now, now))
-conn.commit(); conn.close()
-print("OK")
-PYEOF
-
-docker cp /tmp/inject_image_warning.py "$WEBUI_CONTAINER":/tmp/
-STEP5G_OUTPUT=$(docker exec "$WEBUI_CONTAINER" python3 /tmp/inject_image_warning.py 2>&1)
-docker exec "$WEBUI_CONTAINER" rm /tmp/inject_image_warning.py 2>/dev/null || true
-rm /tmp/inject_image_warning.py
-
-if echo "$STEP5G_OUTPUT" | grep -q 'OK'; then
-  log_ok "Image Deletion Warning filter installed"
-  docker restart "$WEBUI_CONTAINER" >/dev/null 2>&1
-else
-  log_warn "Image Deletion Warning filter install failed (non-fatal): $STEP5G_OUTPUT"
-fi
 echo ''
 echo '=== CUSTODIAN — READY ==='
 echo "  Open WebUI:  http://${SERVER_IP}:${WEBUI_PORT:-3000}"

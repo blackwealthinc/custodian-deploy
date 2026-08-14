@@ -56,7 +56,9 @@ services:
     restart: unless-stopped
 
     environment:
-      - OPENAI_API_BASE_URLS=http://hermes:8642/v1;http://100.64.0.1:4000/v1
+      # Plural: Hermes (chat) + Budget Proxy (vision/images). Semicolon-separated.
+      # LiteLLM URL parameterized via BUDGET_PROXY_URL (default: internal Tailscale IP)
+      - OPENAI_API_BASE_URLS=http://hermes:8642/v1;${BUDGET_PROXY_URL:-http://100.64.0.1:4000/v1}
       - OPENAI_API_KEYS=${API_SERVER_KEY};${CUSTOMER_API_KEY}
       - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY}
       - TZ=${TZ:-America/Chicago}
@@ -72,7 +74,7 @@ services:
       - IMAGE_GENERATION_ENGINE=openai
       - IMAGE_GENERATION_MODEL=gpt-image-2-hd
       - IMAGE_SIZE=1024x1024
-      - IMAGES_OPENAI_API_BASE_URL=http://100.64.0.1:4000/v1
+      - IMAGES_OPENAI_API_BASE_URL=${BUDGET_PROXY_URL:-http://100.64.0.1:4000/v1}
       - IMAGES_OPENAI_API_KEY=${CUSTOMER_API_KEY}
       # Upload limits
       - RAG_FILE_MAX_SIZE=100

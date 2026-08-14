@@ -10,7 +10,8 @@
 #   Bug #96: cleanup timer pointed at /home/custodian (empty) -> /data/webui-data (real)
 #   Bug #97: "Custodian" base_model_id='Custodian' dangling -> 'hermes-backend'
 #   Bug #99: RAG_FILE_MAX_SIZE=10000 (10GB/file) -> 100 (100MB/file) + 10GB TOTAL cap
-#   Step 5g: Image Deletion Warning filter (3-day auto-delete notice)
+#   Bug #104: removed dead Image Deletion Warning filter (filters can't hook image gen;
+#             the model description is the reliable 3-day warning)
 #
 # WHY auto-detect (Bug #94 fix):
 #   Original deployment used CUSTODIAN_HOME=/data, so the compose's relative
@@ -197,57 +198,16 @@ systemctl daemon-reload
 systemctl enable --now custodian-cleanup.timer
 echo "Cleanup timer installed (target: ${CUSTODIAN_HOME}/webui-data/uploads)"
 
-# ── 11. Install Image Deletion Warning filter (Step 5g) ──
-echo "Installing Image Deletion Warning filter..."
-cat > /tmp/inject_image_warning.py << 'PYEOF'
-import sqlite3, json, uuid, time
-conn = sqlite3.connect('/app/backend/data/webui.db')
-now = int(time.time())
-
-source = '''"""
-title: Image Deletion Warning
-author: Custodian
-description: Warns that generated images are auto-deleted after 3 days.
-version: 1.0.0
-"""
-from pydantic import BaseModel, Field
-from typing import Optional
-
-class Filter:
-    class Valves(BaseModel):
-        priority: int = Field(default=0)
-
-    def __init__(self):
-        self.valves = self.Valves()
-
-    async def inlet(self, body: dict, __user__: Optional[dict] = None, __event_emitter__=None) -> dict:
-        model = body.get("model", "")
-        if model in {"374e596f-9137-584f-a75a-b770059dee2e", "gpt-image-2-hd"} and __event_emitter__:
-            await __event_emitter__({
-                "type": "status",
-                "data": {"description": "Images are auto-deleted after 3 days — save important images locally.", "done": True}
-            })
-        return body
-'''
-
-meta = json.dumps({"description": "Warns that generated images are deleted after 3 days.",
-                   "manifest": {"name": "Image Deletion Warning", "version": "1.0.0"}})
-valves = json.dumps({})
-func_id = str(uuid.uuid4())
-
-existing = conn.execute("SELECT id FROM function WHERE name='Image Deletion Warning' AND type='filter'").fetchone()
-if existing:
-    conn.execute("UPDATE function SET content=?, meta=?, updated_at=? WHERE id=?", (source, meta, now, existing[0]))
-else:
-    conn.execute("INSERT INTO function (id, user_id, name, type, content, meta, valves, is_active, is_global, updated_at, created_at) VALUES (?, NULL, ?, 'filter', ?, ?, ?, TRUE, TRUE, ?, ?)",
-        (func_id, 'Image Deletion Warning', source, meta, valves, now, now))
-conn.commit(); conn.close()
-print("OK")
-PYEOF
-
-docker cp /tmp/inject_image_warning.py "$WEBUI_CONTAINER":/tmp/
-docker exec "$WEBUI_CONTAINER" python3 /tmp/inject_image_warning.py 2>&1
-docker exec "$WEBUI_CONTAINER" rm /tmp/inject_image_warning.py 2>/dev/null || true
+# ── 11. Remove stale Image Deletion Warning filter (Bug #104 — filter can't fire for image gen) ──
+echo "Removing stale Image Deletion Warning filter (if present)..."
+docker exec "$WEBUI_CONTAINER" python3 -c "
+import sqlite3
+c = sqlite3.connect('/app/backend/data/webui.db')
+n = c.execute(\"DELETE FROM function WHERE name='Image Deletion Warning'\").rowcount
+c.commit()
+print(f'REMOVED {n} stale filter(s)')
+c.close()
+" 2>&1 2>/dev/null || true
 rm /tmp/inject_image_warning.py
 
 # ── 12. Restart WebUI once to reload models + filters ──
