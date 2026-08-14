@@ -39,7 +39,7 @@ if [ -z "$API_SERVER_KEY" ]; then
     API_SERVER_KEY=$(docker exec "$WEBUI_CONTAINER" python3 -c "
 import sqlite3, json
 c = sqlite3.connect('/app/backend/data/webui.db')
-r = c.execute('SELECT value FROM config WHERE key=\\\"openai.api_keys\\\"').fetchone()
+r = c.execute('SELECT value FROM config WHERE key=?', ('openai.api_keys',)).fetchone()
 if r:
     keys = json.loads(r[0])
     print(keys[0] if keys else '')
@@ -207,8 +207,7 @@ n = c.execute(\"DELETE FROM function WHERE name='Image Deletion Warning'\").rowc
 c.commit()
 print(f'REMOVED {n} stale filter(s)')
 c.close()
-" 2>&1 2>/dev/null || true
-rm /tmp/inject_image_warning.py
+" 2>&1 || true
 
 # ── 12. Restart WebUI once to reload models + filters ──
 echo "Restarting WebUI to reload models + filters..."
