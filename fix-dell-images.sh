@@ -210,7 +210,7 @@ else:
 # ── 3. De-jargon the "Custodian" model description ──
 custodian_meta = json.dumps({
     "capabilities": {"web_search": True, "vision": True},
-    "description": "Your AI assistant for questions, writing, and everyday help. To create images, switch to 'Custodian Images'.",
+    "description": "Your AI assistant for questions, writing, and everyday help. To create images, switch to 'Custodian Images'. Images are kept for 3 days, then removed automatically.",
 })
 custodian = conn.execute(
     "SELECT id FROM model WHERE name='Custodian' AND base_model_id IS NOT NULL"
