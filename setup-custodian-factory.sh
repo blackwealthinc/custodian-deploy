@@ -766,7 +766,10 @@ configs = {r[0]: json.loads(r[1]) if r[1] else (
 changes = 0
 
 # Add LiteLLM as second connection (index 1) if not present
-liteLLM_url = "http://100.64.0.1:4000/v1"
+# Bug #105 (incomplete fix): use the env var Docker Compose already set
+# (parameterized via BUDGET_PROXY_URL) instead of hardcoding the Tailscale IP,
+# so image generation routes correctly even off-mesh.
+liteLLM_url = os.environ.get("IMAGES_OPENAI_API_BASE_URL", "http://100.64.0.1:4000/v1")
 urls = configs.get("openai.api_base_urls", [])
 if liteLLM_url not in urls:
     keys = configs.get("openai.api_keys", [])
