@@ -36,7 +36,7 @@ if [ -z "${!_CAK_VN:-}" ]; then
   KEY_RESPONSE=$(curl -s -X POST "${BUDGET_PROXY_URL%/v1}/key/generate" \
     -H "Authorization: Bearer ${!_LMK_VN}" \
     -H "Content-Type: application/json" \
-    -d "{\"key_alias\": \"${CUSTOMER_ID:-custodian}\", \"models\": [\"deepseek-v4-pro\", \"dashscope-vision\", \"gpt-image-2-hd\"], \"max_budget\": ${MAX_BUDGET:-25}, \"budget_duration\": \"1mo\"}" 2>/dev/null)
+    -d "{\"key_alias\": \"${CUSTOMER_ID:-custodian}\", \"models\": [\"deepseek-v4-pro\", \"dashscope-vision\", \"gpt-image-2-hd\"], \"max_budget\": ${MAX_BUDGET:-100}, \"budget_duration\": \"1mo\"}" 2>/dev/null)
   _RAW_KEY=$(echo "$KEY_RESPONSE" | grep -o '"key":"[^"]*"' | head -1 | cut -d'"' -f4)
   if [ -z "${_RAW_KEY}" ]; then
     echo "ERROR: Failed to auto-generate API key. Response:"
@@ -469,6 +469,144 @@ log_step 'Step 5d: Register Custodian Workspace Model'
 
 # Open WebUI only shows the web search toggle for models with web_search in capabilities.
 # API-fetched models (from Hermes) have no workspace entry — create one (Bug #46).
+# Also creates the Custodian Images Pipe (image-only, no chat reply) + auto-selects Custodian.
+
+# Write the Pipe function code (image-only — no chat model in the loop, no text reply)
+cat > /tmp/custodian_images_pipe.py << 'PIPEEOF'
+"""
+title: Custodian Images
+author: Custodian
+description: Creates an image from your description.
+version: 1.0.0
+"""
+
+from pydantic import BaseModel
+import aiohttp
+
+from open_webui.routers.images import (
+    get_image_config,
+    get_image_data,
+    upload_image,
+)
+from open_webui.models.users import UserModel
+
+
+class Pipe:
+    class Valves(BaseModel):
+        pass
+
+    def __init__(self):
+        self.valves = self.Valves()
+
+    async def pipe(
+        self,
+        body,
+        __event_emitter__=None,
+        __user__=None,
+        __request__=None,
+        __metadata__=None,
+    ):
+        # 1. Pull the user's latest prompt out of the message list.
+        prompt = ""
+        for message in reversed(body.get("messages", [])):
+            if message.get("role") != "user":
+                continue
+            content = message.get("content", "")
+            if isinstance(content, str):
+                prompt = content
+            elif isinstance(content, list):
+                parts = []
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        parts.append(part.get("text", ""))
+                prompt = "".join(parts)
+            break
+        prompt = prompt.strip()
+        if not prompt:
+            return "Tell me what you'd like me to create, and I'll make an image of it."
+
+        if __event_emitter__ is not None:
+            await __event_emitter__(
+                {"type": "status", "data": {"description": "Creating your image...", "done": False}}
+            )
+
+        # 2. Read the image configuration — same source the native image
+        #    generator uses, so key/model/URL always stay in sync.
+        image_config = await get_image_config()
+
+        # 3. Call the image engine.
+        payload = {
+            "model": image_config.IMAGE_GENERATION_MODEL,
+            "prompt": prompt,
+            "n": 1,
+        }
+        if getattr(image_config, "IMAGE_SIZE", None):
+            payload["size"] = image_config.IMAGE_SIZE
+        payload["response_format"] = "b64_json"
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{image_config.IMAGES_OPENAI_API_BASE_URL}/images/generations",
+                    headers={
+                        "Authorization": f"Bearer {image_config.IMAGES_OPENAI_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=180),
+                ) as response:
+                    if response.status != 200:
+                        return "I couldn't create that image. Please try again."
+                    data = await response.json()
+        except Exception:
+            return "I couldn't create that image. Please try again."
+
+        # 4. Build the images list. Prefer uploading into OpenWebUI storage so
+        #    the 3-day cleanup applies; fall back to an inline data URI.
+        user_obj = None
+        try:
+            if isinstance(__user__, dict) and __user__.get("id"):
+                user_obj = UserModel(**__user__)
+        except Exception:
+            user_obj = None
+
+        metadata = __metadata__ if isinstance(__metadata__, dict) else {}
+
+        images = []
+        for item in data.get("data", []):
+            raw = item.get("url") or item.get("b64_json") or ""
+            if not raw:
+                continue
+            url = None
+            if user_obj is not None and __request__ is not None:
+                try:
+                    image_data, content_type = await get_image_data(raw)
+                    if image_data is not None and content_type is not None:
+                        _, url = await upload_image(
+                            __request__, image_data, content_type, metadata, user_obj
+                        )
+                except Exception:
+                    url = None
+            if not url:
+                if raw.startswith(("http://", "https://")):
+                    url = raw
+                else:
+                    url = f"data:image/png;base64,{raw}"
+            images.append({"type": "image", "url": url})
+
+        if not images:
+            return "I couldn't create that image. Please try again."
+
+        if __event_emitter__ is not None:
+            await __event_emitter__(
+                {"type": "status", "data": {"description": "Image created", "done": True}}
+            )
+            await __event_emitter__({"type": "files", "data": {"files": images}})
+
+        return ""
+
+PIPEEOF
+
 cat > /tmp/create_model.py << 'PYEOF'
 import sqlite3, json, uuid, time
 
@@ -477,13 +615,13 @@ conn = sqlite3.connect('/app/backend/data/webui.db')
 # Bug #49: UPSERT — update existing model with latest capabilities instead of skipping
 now = int(time.time())
 
-# Custodian model meta — defined BEFORE UPSERT (Bug #87: meta was undefined in UPDATE path)
+# Custodian model meta — de-jargoned + 3-day image deletion warning
 meta = json.dumps({
     "capabilities": {
         "web_search": True,
         "vision": True
     },
-    "description": "Custodian AI — Hermes + DeepSeek via Budget Proxy. For images, switch to 'Custodian Images' model."
+    "description": "Your AI assistant for questions, writing, and everyday help. To create images, switch to 'Custodian Images'. Images are kept for 3 days, then removed automatically."
 })
 
 # UPSERT Custodian model
@@ -491,47 +629,59 @@ existing = conn.execute("SELECT id FROM model WHERE name='Custodian'").fetchone(
 if existing:
     conn.execute('UPDATE model SET base_model_id=?, meta=?, updated_at=? WHERE id=?',
         ('hermes-backend', meta, now, existing[0]))
+    custodian_id = existing[0]
     was_update = True
 else:
     model_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, 'custodian-model'))
     conn.execute('''INSERT INTO model (id, user_id, base_model_id, name, params, meta, is_active, created_at, updated_at)
 VALUES (?, ?, ?, ?, ?, ?, TRUE, ?, ?)''',
         (model_id, '', 'hermes-backend', 'Custodian', json.dumps({}), meta, now, now))
+    custodian_id = model_id
     was_update = False
 
-# UPSERT Custodian Images model (Bug #84 fix — now runs on re-runs too)
-image_model_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, 'custodian-images'))
-image_meta = json.dumps({
-    "capabilities": {
-        "image_generation": True
-    },
-    "description": "DALL-E HD image generation via LiteLLM. Images auto-deleted after 3 days. Save important ones locally."
+# DELETE broken "Custodian Images" chat model (Bug #106) — replaced by a Pipe function
+broken = conn.execute(
+    "SELECT id FROM model WHERE name='Custodian Images' AND base_model_id='gpt-image-2-hd'"
+).fetchall()
+for row in broken:
+    conn.execute("DELETE FROM model WHERE id=?", (row[0],))
+
+# UPSERT Custodian Images Pipe function (Bug #106 fix)
+pipe_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, 'custodian-images-pipe'))
+pipe_meta = json.dumps({
+    "description": "Turn your description into an image. Images are kept for 3 days, then removed automatically.",
+    "manifest": {"name": "Custodian Images", "version": "1.0.0"},
 })
+with open('/tmp/custodian_images_pipe.py', 'r') as f:
+    pipe_content = f.read()
 
-existing_img = conn.execute(
-    "SELECT id FROM model WHERE name='Custodian Images'"
-).fetchone()
-
-if existing_img:
-    conn.execute('UPDATE model SET meta=?, updated_at=? WHERE id=?',
-        (image_meta, now, existing_img[0]))
+existing_pipe = conn.execute("SELECT id FROM function WHERE id=?", (pipe_id,)).fetchone()
+if existing_pipe:
+    conn.execute(
+        "UPDATE function SET name=?, type=?, content=?, meta=?, is_active=?, is_global=?, updated_at=? WHERE id=?",
+        ('Custodian Images', 'pipe', pipe_content, pipe_meta, True, True, now, pipe_id))
 else:
     conn.execute(
-        "INSERT INTO model (id, user_id, base_model_id, name, params, meta, is_active, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, TRUE, ?, ?)",
-        (image_model_id, '', 'gpt-image-2-hd', 'Custodian Images', json.dumps({}), image_meta, now, now)
-    )
+        "INSERT INTO function (id, user_id, name, type, content, meta, valves, is_active, is_global, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (pipe_id, None, 'Custodian Images', 'pipe', pipe_content, pipe_meta, '{}', True, True, now, now))
+
+# Auto-select Custodian as the default model
+conn.execute(
+    "INSERT INTO config (key, value) VALUES ('ui.default_models', ?) "
+    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+    (json.dumps(custodian_id),))
 
 conn.commit()
 conn.close()
 print('UPDATED' if was_update else 'CREATED')
 PYEOF
 
+docker cp /tmp/custodian_images_pipe.py "$WEBUI_CONTAINER":/tmp/
 docker cp /tmp/create_model.py "$WEBUI_CONTAINER":/tmp/
 STEP5D_OUTPUT=$(docker exec "$WEBUI_CONTAINER" python3 /tmp/create_model.py 2>&1)
-docker exec "$WEBUI_CONTAINER" rm /tmp/create_model.py 2>/dev/null || true
-rm /tmp/create_model.py
-
+docker exec "$WEBUI_CONTAINER" rm -f /tmp/custodian_images_pipe.py /tmp/create_model.py 2>/dev/null || true
+rm -f /tmp/custodian_images_pipe.py /tmp/create_model.py
 if echo "$STEP5D_OUTPUT" | grep -qE 'CREATED|UPDATED'; then
   if echo "$STEP5D_OUTPUT" | grep -q 'UPDATED'; then
     log_ok "Custodian models updated — chat + image generation refreshed"
