@@ -52,7 +52,7 @@ BUDGET_PROXY_URL="${BUDGET_PROXY_URL:-https://budget.ns1net.com/v1}"
 PORT="${PORT:-8642}"
 WEBUI_PORT="${WEBUI_PORT:-3000}"
 CUSTOMER_ID="${CUSTOMER_ID:-custodian}"
-MAX_BUDGET="${MAX_BUDGET:-25}"
+MAX_BUDGET="${MAX_BUDGET:-100}"
 
 # Reuse existing API_SERVER_KEY from WebUI database on re-runs (Bug #18 fix)
 # Without this, every re-run generates a new random key → Hermes gets new key
