@@ -44,7 +44,7 @@ fi
 
 # ── Configuration ──
 HEADSCALE_PORT="${HEADSCALE_PORT:-8080}"
-HEADSCALE_VERSION="${HEADSCALE_VERSION:-latest}"
+HEADSCALE_VERSION="${HEADSCALE_VERSION:-v0.29}"
 HEADSCALE_BASE="/opt/headscale"
 
 OS_ID=$(grep -oP '^ID=\K.+' /etc/os-release | tr -d '"')

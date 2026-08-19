@@ -24,7 +24,7 @@ services:
       - searxng-net
 
   searxng:
-    image: searxng/searxng:latest
+    image: searxng/searxng@sha256:d0aaeb14880e6e92bde1518fcc7261e995783367d63d95203383607bef9c6516
     container_name: searxng
     restart: unless-stopped
     ports:

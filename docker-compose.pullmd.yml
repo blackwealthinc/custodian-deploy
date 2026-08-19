@@ -14,7 +14,7 @@
 
 services:
   trafilatura:
-    image: aeternalabshq/pullmd-trafilatura:latest
+    image: aeternalabshq/pullmd-trafilatura@sha256:a68585d8ae41fd6f4673c39d4c9f3b58c04160ab4de8babb7c97b5f6e8c7b17e
     container_name: pullmd-trafilatura
     restart: unless-stopped
     healthcheck:
@@ -27,7 +27,7 @@ services:
       - extractor-net
 
   pullmd:
-    image: aeternalabshq/pullmd:latest
+    image: aeternalabshq/pullmd@sha256:d8e7dfab3c62e8b7283c98aefe7091311c9cf323314f499ec3fa182eec7d3292
     container_name: pullmd
     restart: unless-stopped
     ports:
