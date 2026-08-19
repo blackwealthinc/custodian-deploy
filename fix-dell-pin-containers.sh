@@ -49,7 +49,10 @@ log_step "Recreate containers (pinned images)"
 cd /opt/searxng
 docker compose -f docker-compose.searxng.yml up -d --force-recreate --no-deps searxng
 cd /opt/pullmd
-docker compose -f docker-compose.pullmd.yml up -d --force-recreate pullmd pullmd-trafilatura
+# NOTE: `docker compose up` takes SERVICE names (the `services:` keys), NOT
+# `container_name`. This file's services are `trafilatura` + `pullmd` (the
+# containers are `pullmd-trafilatura` + `pullmd`). No args = recreate BOTH.
+docker compose -f docker-compose.pullmd.yml up -d --force-recreate
 
 # ── 4. Verify each container now carries the pinned digest ──
 log_step "Verify"
