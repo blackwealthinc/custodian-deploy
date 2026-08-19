@@ -49,6 +49,7 @@ services:
     networks:
       - default
       - searxng-net
+      - extractor-net
 
   openwebui:
     image: ghcr.io/open-webui/open-webui:v0.11.0  # pinned — update WEBUI_PINNED_VERSION in setup script too
@@ -100,3 +101,6 @@ networks:
   searxng-net:
     external: true
     name: searxng-net
+  extractor-net:
+    external: true
+    name: extractor-net

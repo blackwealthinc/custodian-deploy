@@ -98,6 +98,7 @@ echo "  Local API:     http://127.0.0.1:3001/api  (diagnostics only)"
 echo "  Config:        $PULLMD_DIR"
 echo "  Logs:          docker logs pullmd"
 echo ''
-echo '  Hermes instances must connect to extractor-net and add MCP config:'
-echo '    docker network connect extractor-net <customer>-hermes'
+echo '  The factory compose auto-attaches Hermes to extractor-net (Bug #113).'
+echo '  Just set the MCP config once per Hermes instance:'
 echo '    docker exec <customer>-hermes hermes config set mcp_servers.pullmd.url http://pullmd:3000/mcp'
+echo '    docker restart <customer>-hermes'

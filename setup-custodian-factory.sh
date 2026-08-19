@@ -165,11 +165,12 @@ log_step 'Step 4: Deploy Stack'
 # Always download latest compose file — fixes are pushed to GitHub regularly (Bug #18 fix)
 curl -sS -o docker-compose.custodian-factory.yml "$COMPOSE_URL"
 
-# Verify prerequisite networks exist (fail fast — Bug #39)
-for net in searxng-net; do
+# Verify prerequisite networks exist (fail fast — Bug #39, #113)
+for net in searxng-net extractor-net; do
     if ! docker network inspect "$net" >/dev/null 2>&1; then
         log_error "$net not found — run the prerequisite scripts first:"
         log_error "  1. setup-searxng.sh    (creates searxng-net)"
+        log_error "  2. setup-extractor.sh  (creates extractor-net)"
         exit 3
     fi
     log_ok "$net found"
