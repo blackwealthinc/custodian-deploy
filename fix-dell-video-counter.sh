@@ -94,16 +94,18 @@ if old:
     )
     changes.append(f"BACKED UP old openai.api_configs -> {bak_key}")
 
-# Connection 0 = hermes (chat), connection 1 = LiteLLM (vision/images).
+# Connection 1 = LiteLLM (vision/images) — restrict to dashscope-vision so the
+# 4 stale provider-named models (deepseek-*, gpt-image-2-hd) are NOT re-fetched.
+# Connection 0 (hermes) is left untouched: it serves only "hermes-backend",
+# which the "Custodian" model aliases — restricting it would be a no-op.
 new_api_configs = json.dumps({
-    "0": {"model_ids": ["hermes-backend"]},
     "1": {"model_ids": ["dashscope-vision"]},
 })
 conn.execute(
     "INSERT INTO config (key, value) VALUES ('openai.api_configs', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
     (new_api_configs,),
 )
-changes.append("SET openai.api_configs -> {0: hermes-backend, 1: dashscope-vision}")
+changes.append("SET openai.api_configs -> {1: dashscope-vision}")
 
 conn.commit()
 conn.close()

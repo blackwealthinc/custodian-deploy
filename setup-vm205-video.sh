@@ -60,7 +60,7 @@ PYEOF
 echo ""
 echo "=== Step 2: Allow custodian-video on customer keys (models restriction) ==="
 docker exec custodian-postgres psql -U custodian -d custodian -c \
-  'UPDATE "LiteLLM_VerificationToken" SET models = array_append(models, $$custodian-video$$) WHERE models IS NOT NULL AND NOT ($$custodian-video$$ = ANY(models));' 2>&1 || \
+  'UPDATE "LiteLLM_VerificationToken" SET models = array_append(models, $$custodian-video$$) WHERE models IS NOT NULL AND cardinality(models) > 0 AND NOT ($$custodian-video$$ = ANY(models));' 2>&1 || \
   echo "WARN: DB update failed — check the LiteLLM_VerificationToken schema"
 
 echo ""

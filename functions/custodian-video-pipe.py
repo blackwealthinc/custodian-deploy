@@ -14,6 +14,17 @@ from urllib.parse import quote
 from open_webui.routers.images import get_image_config
 
 
+def _first_object(payload):
+    """LiteLLM's raw /videos REST endpoints wrap responses in an OpenAI-style
+    {"data": [VideoObject]} envelope (the SDK unwraps this; raw HTTP does not).
+    Return the inner object so .id / .status resolve correctly."""
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, list) and data:
+            return data[0]
+    return payload if isinstance(payload, dict) else {}
+
+
 class Pipe:
     class Valves(BaseModel):
         # Provider/model config lives here — never hardcoded in code.
@@ -91,7 +102,7 @@ class Pipe:
                 ) as response:
                     if response.status != 200:
                         return "I couldn't create that video. Please try again."
-                    job = await response.json()
+                    job = _first_object(await response.json())
 
                 video_id = job.get("id") or job.get("video_id")
                 if not video_id:
@@ -107,7 +118,7 @@ class Pipe:
                     ) as response:
                         if response.status != 200:
                             continue
-                        status = await response.json()
+                        status = _first_object(await response.json())
                     state = status.get("status")
                     if state == "completed":
                         break
