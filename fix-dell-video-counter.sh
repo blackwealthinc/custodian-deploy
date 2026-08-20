@@ -71,10 +71,14 @@ upsert_pipe('Custodian Video', 'custodian-video-pipe', '/tmp/custodian_video_pip
 upsert_pipe('Custodian Budget', 'custodian-budget-pipe', '/tmp/custodian_budget_pipe.py',
              'Shows how much you have used this month.')
 
-# 2. Hide stale provider-named models (API-fetched rows only — base_model_id IS NULL).
+# 2. Hide stale provider-named base models (API-synced rows only — base_model_id IS NULL).
+#    These leak DeepSeek/Hermes/GPT brand names in the dropdown. "Custodian"
+#    (base_model_id='hermes-backend', NOT NULL) is untouched — routing resolves
+#    base_model_id via the connection's OPENAI_MODELS, NOT this DB table, so
+#    deleting the base row only affects the dropdown, never chat routing.
 stale = conn.execute(
     "SELECT id, name FROM model WHERE name IN "
-    "('deepseek-chat','deepseek-v4-flash','deepseek-v4-pro','gpt-image-2-hd') AND base_model_id IS NULL"
+    "('hermes-backend','deepseek-chat','deepseek-v4-flash','deepseek-v4-pro','gpt-image-2-hd') AND base_model_id IS NULL"
 ).fetchall()
 for row in stale:
     conn.execute("DELETE FROM model WHERE id=?", (row[0],))

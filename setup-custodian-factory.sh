@@ -647,6 +647,19 @@ broken = conn.execute(
 for row in broken:
     conn.execute("DELETE FROM model WHERE id=?", (row[0],))
 
+# White-label cleanup (Bug #117 + #115): delete provider-named BASE models that
+# model sync may have added. These leak DeepSeek/Hermes/GPT brand names in the
+# dropdown. "Custodian" (base_model_id='hermes-backend', NOT NULL) is untouched —
+# routing resolves base_model_id via the connection's OPENAI_MODELS, not this
+# DB table, so deleting the base row only affects the dropdown, never chat routing.
+stale = conn.execute(
+    "SELECT id, name FROM model WHERE name IN "
+    "('hermes-backend','deepseek-chat','deepseek-v4-flash','deepseek-v4-pro','gpt-image-2-hd') "
+    "AND base_model_id IS NULL"
+).fetchall()
+for row in stale:
+    conn.execute("DELETE FROM model WHERE id=?", (row[0],))
+
 # UPSERT Custodian Images Pipe function (Bug #106 fix)
 pipe_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, 'custodian-images-pipe'))
 pipe_meta = json.dumps({
