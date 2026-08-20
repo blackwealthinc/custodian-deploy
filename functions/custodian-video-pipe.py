@@ -9,6 +9,7 @@ from pydantic import BaseModel
 import aiohttp
 import asyncio
 import base64
+from urllib.parse import quote
 
 from open_webui.routers.images import get_image_config
 
@@ -16,7 +17,11 @@ from open_webui.routers.images import get_image_config
 class Pipe:
     class Valves(BaseModel):
         # Provider/model config lives here — never hardcoded in code.
-        MODEL: str = "gemini/veo-3.1-generate-preview"
+        # MODEL is the LiteLLM model_name (NOT the full provider path). It maps
+        # to a model_list entry on the proxy (e.g. "custodian-video" ->
+        # gemini/veo-3.1-lite-generate-preview). To change tier (Lite/Fast/Std),
+        # change the proxy's litellm_params.model — the customer key stays the same.
+        MODEL: str = "custodian-video"
         SIZE: str = "1280x720"
         SECONDS: str = "8"
         # API key + base URL are intentionally NOT valves. They're read from the
@@ -96,7 +101,7 @@ class Pipe:
                 for _ in range(24):  # up to ~4 min
                     await asyncio.sleep(10)
                     async with session.get(
-                        f"{base_url}/videos/{video_id}",
+                        f"{base_url}/videos/{quote(video_id, safe='')}",
                         headers={"Authorization": f"Bearer {api_key}"},
                         timeout=aiohttp.ClientTimeout(total=30),
                     ) as response:
@@ -113,7 +118,7 @@ class Pipe:
 
                 # 3c. Download the finished video.
                 async with session.get(
-                    f"{base_url}/videos/{video_id}/content",
+                    f"{base_url}/videos/{quote(video_id, safe='')}/content",
                     headers={"Authorization": f"Bearer {api_key}"},
                     timeout=aiohttp.ClientTimeout(total=120),
                 ) as response:
