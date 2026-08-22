@@ -1,0 +1,34 @@
+CUSTODIAN WHITE-LABEL FIX (rename-not-hide) — Run on the Dell
+=============================================================
+
+1) SSH into the Dell as the custodian user:
+   ssh custodian@192.168.50.250
+   (or via the VM205 jump if the Dell's Ethernet is down)
+
+2) Run the fix (single line, copy-paste exact):
+   curl -s https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/fix-dell-whitelabel.sh | sudo -E bash
+
+3) After it finishes, verify in the browser:
+   - Model dropdown shows ONLY:
+       Custodian          (chat — was "Model not found", now works)
+       Custodian Vision   (internal vision model)
+       Custodian Images
+       Custodian Video
+       Custodian Budget
+   - These must be GONE from the dropdown:
+       hermes-backend, deepseek-chat, deepseek-v4-pro, deepseek-v4-flash,
+       gpt-image-2-hd, dashscope-vision, custodian-video, Arena Model
+   - Send a plain-text message to "Custodian" -> must return a real reply.
+   - Attach an image -> the AI must "see" it (vision routes via dashscope-vision).
+
+ROLLBACK (if needed)
+--------------------
+Backups are saved to:
+   /data/backups/whitelabel-<timestamp>/
+   - docker-compose.custodian-factory.yml
+   - webui.db
+   - .env
+
+To restore the DB (undo the rename):
+   sudo cp /data/backups/whitelabel-<timestamp>/webui.db /data/webui-data/webui.db
+   docker restart admin-webui

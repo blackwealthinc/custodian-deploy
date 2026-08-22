@@ -71,21 +71,27 @@ upsert_pipe('Custodian Video', 'custodian-video-pipe', '/tmp/custodian_video_pip
 upsert_pipe('Custodian Budget', 'custodian-budget-pipe', '/tmp/custodian_budget_pipe.py',
              'Shows how much you have used this month.')
 
-# 2. Hide stale provider-named base models (API-synced rows only — base_model_id IS NULL).
-#    These leak DeepSeek/Hermes/GPT brand names in the dropdown. "Custodian"
-#    (base_model_id='hermes-backend', NOT NULL) is untouched — routing resolves
-#    base_model_id via the connection's OPENAI_MODELS, NOT this DB table, so
-#    deleting the base row only affects the dropdown, never chat routing.
-stale = conn.execute(
-    "SELECT id, name FROM model WHERE name IN "
-    "('hermes-backend','deepseek-chat','deepseek-v4-flash','deepseek-v4-pro','gpt-image-2-hd') AND base_model_id IS NULL"
-).fetchall()
-for row in stale:
-    conn.execute("DELETE FROM model WHERE id=?", (row[0],))
-    changes.append(f"DELETED stale model {row[1]} (id={row[0][:8]}...)")
-    print(f"DELETED stale model {row[1]}")
-if not stale:
-    print("OK: no stale models found (already clean)")
+# 2. White-label via RENAME-not-hide (Bug #128/#129 fix). Hiding (is_active=0) or
+#    deleting a base model either breaks routing (is_active=0 removes it from
+#    request.app.state.MODELS) or does nothing (DELETE leaves it visible from the
+#    connection). RENAME keeps the base in MODELS under a clean name. Only
+#    unreferenced models (deepseek-*, gpt-image-2-hd, custodian-video) are hidden.
+def upsert_model(model_id, name, active, base=None):
+    conn.execute(
+        "INSERT INTO model (id, user_id, base_model_id, name, params, meta, created_at, updated_at, is_active) "
+        "VALUES (?, '', ?, ?, '{}', '{}', ?, ?, ?) "
+        "ON CONFLICT(id) DO UPDATE SET base_model_id=excluded.base_model_id, name=excluded.name, is_active=excluded.is_active, updated_at=excluded.updated_at",
+        (model_id, base, name, now, now, active),
+    )
+
+upsert_model('hermes-backend', 'Custodian', 1)
+upsert_model('dashscope-vision', 'Custodian Vision', 1)
+for m in ('deepseek-chat', 'deepseek-v4-flash', 'deepseek-v4-pro', 'gpt-image-2-hd', 'custodian-video'):
+    upsert_model(m, m, 0)
+# hide the old derived "Custodian" (UUID) to avoid a duplicate next to the renamed base
+conn.execute("UPDATE model SET is_active=0 WHERE name='Custodian' AND base_model_id='hermes-backend'")
+changes.append("White-labeled models via rename-not-hide")
+print("White-labeled models via rename-not-hide")
 
 # 3. Restrict OpenAI connection model_ids (index-keyed) so stale models + the new
 #    custodian-video model are NOT re-fetched into the dropdown. Back up old value first.

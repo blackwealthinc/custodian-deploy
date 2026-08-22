@@ -7,14 +7,15 @@
 #   Bug #120      — "Arena Model" visible in the dropdown
 #   Bug #123      — RAG_FILE_MAX_COUNT is a no-op (remove misleading config)
 #
-# Mechanism (verified against OpenWebUI v0.11.0 source on the Dell):
+# Mechanism (corrected 2026-08-21 — Bug #128 fix):
 #   - The DB `model` table IS honored even with ENABLE_PERSISTENT_CONFIG=false
 #     (only the `config` table is ignored). A row with base_model_id=NULL +
-#     is_active=0 removes that model from the DROPDOWN only — it stays in
-#     OPENAI_MODELS, so chat ("Custodian" -> hermes-backend) and vision
-#     ("Dynamic Vision Router" -> dashscope-vision) keep working.
-#   - Hiding is display-only (utils/models.py get_all_models -> models.remove).
-#     Routing uses OPENAI_MODELS (openai.py), which is untouched.
+#     is_active=0 triggers models.remove() in utils/models.py get_all_models(),
+#     which removes the model from request.app.state.MODELS — the SAME list
+#     main.py uses for resolution (main.py:1070 direct, main.py:1102 base_model_id).
+#     So hiding a base model BREAKS routing, not just the dropdown.
+#   - Correct approach = RENAME-not-hide: base_model_id=NULL + is_active=1 +
+#     a white-labeled name. Keeps the model in MODELS under a clean name.
 #
 # Usage (run on the Dell):
 #   curl -s https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/fix-dell-whitelabel.sh | sudo -E bash
@@ -48,35 +49,61 @@ log "Backed up compose + DB + .env -> $BACKUP_DIR"
 # STEP 1: Hide raw provider model names (DB override rows) — NO container
 #         recreate needed. Safe and reversible.
 # ---------------------------------------------------------------------------
-log "Step 1: hiding raw model names from the dropdown (display-only)..."
+log "Step 1: white-label via RENAME-not-hide (Bug #128 fix)..."
 
 python3 - "$WEBUI_DB" <<'PYEOF'
 import sqlite3, sys, time
 db = sys.argv[1]
 conn = sqlite3.connect(db)
 now = int(time.time())
-raw_models = [
-    "hermes-backend",     # connection 0 (Hermes gateway) raw name
-    "deepseek-chat",      # connection 1 (LiteLLM budget proxy) raw names
-    "deepseek-v4-pro",
-    "deepseek-v4-flash",
-    "gpt-image-2-hd",
-    "dashscope-vision",   # still routed by the Dynamic Vision Router filter
-    "custodian-video",
-]
-for m in raw_models:
+
+def upsert(model_id, name, active, base=None):
     conn.execute(
         """
         INSERT INTO model (id, user_id, base_model_id, name, params, meta, created_at, updated_at, is_active)
-        VALUES (?, '', NULL, ?, '{}', '{}', ?, ?, 0)
-        ON CONFLICT(id) DO UPDATE SET base_model_id=NULL, is_active=0, updated_at=excluded.updated_at
+        VALUES (?, '', ?, ?, '{}', '{}', ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET base_model_id=excluded.base_model_id, name=excluded.name, is_active=excluded.is_active, updated_at=excluded.updated_at
         """,
-        (m, m, now, now),
+        (model_id, base, name, now, now, active),
     )
+
+# RENAME-not-hide: a base model with is_active=0 is REMOVED from
+# request.app.state.MODELS (utils/models.py models.remove), which main.py uses
+# for resolution — hiding a base breaks routing. RENAME keeps it in MODELS
+# under a white-labeled name. Only truly-unreferenced models are hidden.
+upsert("hermes-backend", "Custodian", 1)           # base of "Custodian" (chat)
+upsert("dashscope-vision", "Custodian Vision", 1)  # Dynamic Vision Router target
+upsert("deepseek-chat", "deepseek-chat", 0)        # unreferenced — safe to hide
+upsert("deepseek-v4-pro", "deepseek-v4-pro", 0)
+upsert("deepseek-v4-flash", "deepseek-v4-flash", 0)
+upsert("gpt-image-2-hd", "gpt-image-2-hd", 0)
+upsert("custodian-video", "custodian-video", 0)
+
+# Copy the description/capabilities from the old derived "Custodian" (UUID)
+# onto the renamed base, so the white-label keeps its friendly text.
+row = conn.execute("SELECT meta FROM model WHERE name='Custodian' AND base_model_id='hermes-backend'").fetchone()
+if row and row[0] and row[0] not in ('{}', ''):
+    conn.execute("UPDATE model SET meta=? WHERE id='hermes-backend'", (row[0],))
+
+# Hide the OLD derived "Custodian" (UUID, base=hermes-backend) — it would show
+# as a duplicate next to the renamed hermes-backend -> "Custodian".
+conn.execute(
+    "UPDATE model SET is_active=0, updated_at=? WHERE name='Custodian' AND base_model_id='hermes-backend'",
+    (now,),
+)
+
+# Point the default model at the renamed base (id=hermes-backend), not the hidden UUID.
+conn.execute(
+    "UPDATE config SET value=? WHERE key='ui.default_models'",
+    ('"hermes-backend"',),
+)
+
 conn.commit()
-print(f"  Hidden {len(raw_models)} raw model names")
-r = conn.execute("SELECT name, is_active, base_model_id FROM model WHERE name='Custodian'").fetchall()
-print("  Custodian model intact:", r)
+print("  Renamed hermes-backend -> Custodian (active)")
+print("  Renamed dashscope-vision -> Custodian Vision (active)")
+print("  Hid 5 unreferenced raw models")
+print("  Hid old derived Custodian (UUID) to avoid duplicate")
+print("  ui.default_models -> hermes-backend")
 conn.close()
 PYEOF
 
@@ -174,21 +201,22 @@ docker ps --filter "name=$WEBUI_NAME" --format '{{.Names}} | {{.Status}}'
 # ---------------------------------------------------------------------------
 # STEP 5: Verify final state.
 # ---------------------------------------------------------------------------
-log "Step 5: verification — DB model table (Custodian visible + 7 raw hidden):"
+log "Step 5: verification — DB model table (white-labeled):"
 python3 - "$WEBUI_DB" <<'PYEOF'
 import sqlite3, sys
 conn = sqlite3.connect(sys.argv[1])
 for r in conn.execute("SELECT name, is_active, base_model_id FROM model ORDER BY name").fetchall():
-    state = "HIDDEN (override)" if r[1] == 0 else "visible"
+    state = "hidden" if r[1] == 0 else "VISIBLE"
     print(f"  {r[0]:22} active={r[1]} base={r[2]} -> {state}")
 conn.close()
 PYEOF
 
 log ""
 log "DONE."
-log "  - Raw provider names hidden from dropdown (Bugs #117/#118)"
+log "  - White-labeled via rename-not-hide (Bug #128/#129)"
+log "  - hermes-backend -> Custodian, dashscope-vision -> Custodian Vision"
 log "  - Arena flag added to compose (Bug #120)"
 log "  - RAG_FILE_MAX_COUNT removed (Bug #123)"
 log "  - Backups at: $BACKUP_DIR"
-log "  - Next: browser-verify the dropdown shows only 'Custodian' + pipes,"
-log "    and that attaching an image still works (vision)."
+log "  - Next: browser-verify the dropdown shows 'Custodian' + 'Custodian Vision' + pipes,"
+log "    AND that a plain-text chat works AND attaching an image works (vision)."
