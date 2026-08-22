@@ -111,7 +111,10 @@ CUSTOMER_ID_DETECTED="$(docker ps --format '{{.Names}}' | grep -E '\-webui$' | h
 log "  Detected CUSTOMER_ID from running container: ${CUSTOMER_ID_DETECTED:-<none>}"
 
 MISSING=0
-for k in CUSTOMER_ID API_SERVER_KEY CUSTOMER_API_KEY WEBUI_SECRET_KEY BUDGET_PROXY_URL; do
+# Only the no-default API keys are hard blockers — these would BLANK on recreate
+# if absent (Bug #114). CUSTOMER_ID has a fallback (derived from container name),
+# and BUDGET_PROXY_URL/TZ/PORT have defaults in the compose file.
+for k in API_SERVER_KEY CUSTOMER_API_KEY WEBUI_SECRET_KEY; do
     if ! grep -qE "^${k}=[^[:space:]]+" "$DATA_DIR/.env" 2>/dev/null; then
         log "  WARN: .env missing/empty $k"
         MISSING=1
@@ -134,9 +137,14 @@ log "Step 4: recreating openwebui container..."
 cd "$DATA_DIR"
 
 RECREATE_ENV=()
-if [ -n "${CUSTOMER_ID_DETECTED:-}" ] && ! grep -qE '^CUSTOMER_ID=[^[:space:]]+' "$DATA_DIR/.env" 2>/dev/null; then
+if [ -n "${CUSTOMER_ID_DETECTED:-}" ]; then
+    # ALWAYS pass CUSTOMER_ID explicitly from the running container — this
+    # overrides any stale/wrong CUSTOMER_ID in .env and guarantees the recreate
+    # targets the SAME container (admin-webui) instead of the compose default.
     RECREATE_ENV=("CUSTOMER_ID=$CUSTOMER_ID_DETECTED")
     log "  Passing CUSTOMER_ID explicitly: $CUSTOMER_ID_DETECTED"
+else
+    log "  WARN: could not detect CUSTOMER_ID — recreate may fall back to compose default"
 fi
 
 if [ "${#RECREATE_ENV[@]}" -gt 0 ]; then
