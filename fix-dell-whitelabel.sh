@@ -136,6 +136,19 @@ fi
 log "Step 4: recreating openwebui container..."
 cd "$DATA_DIR"
 
+# Derive the compose PROJECT name from the running container's label. The Dell's
+# containers were launched with `docker compose -p admin` (project "admin"), NOT
+# the default (directory name "data"). Without the correct project name, docker
+# compose treats hermes as a NEW dependency and tries to CREATE it -> collides
+# with the existing "admin-hermes" ("container name already in use").
+WEBUI_NAME="${CUSTOMER_ID_DETECTED:-admin}-webui"
+COMPOSE_PROJECT="$(docker inspect "$WEBUI_NAME" --format '{{index .Config.Labels "com.docker.compose.project"}}' 2>/dev/null || true)"
+if [ -z "$COMPOSE_PROJECT" ]; then
+    COMPOSE_PROJECT="${CUSTOMER_ID_DETECTED:-admin}"
+    log "  WARN: no compose project label found — defaulting to $COMPOSE_PROJECT"
+fi
+log "  Compose project: $COMPOSE_PROJECT"
+
 RECREATE_ENV=()
 if [ -n "${CUSTOMER_ID_DETECTED:-}" ]; then
     # ALWAYS pass CUSTOMER_ID explicitly from the running container — this
@@ -148,15 +161,14 @@ else
 fi
 
 if [ "${#RECREATE_ENV[@]}" -gt 0 ]; then
-    env "${RECREATE_ENV[@]}" docker compose -f docker-compose.custodian-factory.yml up -d openwebui
+    env "${RECREATE_ENV[@]}" docker compose -p "$COMPOSE_PROJECT" -f docker-compose.custodian-factory.yml up -d openwebui
 else
-    docker compose -f docker-compose.custodian-factory.yml up -d openwebui
+    docker compose -p "$COMPOSE_PROJECT" -f docker-compose.custodian-factory.yml up -d openwebui
 fi
 
 log "  Recreated. Waiting for container to start..."
 sleep 15
 
-WEBUI_NAME="${CUSTOMER_ID_DETECTED:-admin}-webui"
 docker ps --filter "name=$WEBUI_NAME" --format '{{.Names}} | {{.Status}}'
 
 # ---------------------------------------------------------------------------
