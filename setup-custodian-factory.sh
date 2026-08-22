@@ -625,20 +625,18 @@ meta = json.dumps({
     "description": "Your AI assistant for questions, writing, and everyday help. To create images, switch to 'Custodian Images'. Images are kept for 3 days, then removed automatically."
 })
 
-# UPSERT Custodian model
-existing = conn.execute("SELECT id FROM model WHERE name='Custodian'").fetchone()
-if existing:
-    conn.execute('UPDATE model SET base_model_id=?, meta=?, updated_at=? WHERE id=?',
-        ('hermes-backend', meta, now, existing[0]))
-    custodian_id = existing[0]
-    was_update = True
-else:
-    model_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, 'custodian-model'))
-    conn.execute('''INSERT INTO model (id, user_id, base_model_id, name, params, meta, is_active, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, TRUE, ?, ?)''',
-        (model_id, '', 'hermes-backend', 'Custodian', json.dumps({}), meta, now, now))
-    custodian_id = model_id
-    was_update = False
+# White-label "Custodian" = RENAME the hermes-backend base directly (Bug #128/#129 fix).
+# RENAME keeps it in MODELS (routing works) under a clean name. A derived model
+# (base_model_id set) breaks routing unless its base stays in MODELS under a non-leaky
+# name — so we rename the base instead of creating a derived UUID model.
+existing = conn.execute("SELECT id FROM model WHERE id='hermes-backend'").fetchone()
+conn.execute(
+    "INSERT INTO model (id, user_id, base_model_id, name, params, meta, created_at, updated_at, is_active) "
+    "VALUES ('hermes-backend', '', NULL, 'Custodian', '{}', ?, ?, ?, 1) "
+    "ON CONFLICT(id) DO UPDATE SET base_model_id=NULL, name='Custodian', meta=excluded.meta, is_active=1, updated_at=excluded.updated_at",
+    (meta, now, now),
+)
+was_update = existing is not None
 
 # DELETE broken "Custodian Images" chat model (Bug #106) — replaced by a Pipe function
 broken = conn.execute(
@@ -659,14 +657,12 @@ def upsert_model(model_id, name, active, base=None):
         (model_id, base, name, now, now, active),
     )
 
-upsert_model('hermes-backend', 'Custodian', 1)
 upsert_model('dashscope-vision', 'Custodian Vision', 1)
 for m in ('deepseek-chat', 'deepseek-v4-flash', 'deepseek-v4-pro', 'gpt-image-2-hd', 'custodian-video'):
     upsert_model(m, m, 0)
-# hide the old derived "Custodian" (UUID) created above, to avoid a duplicate next to the renamed base
+# hide any legacy derived "Custodian" (UUID, base=hermes-backend) from older deploys,
+# to avoid a duplicate next to the renamed base
 conn.execute("UPDATE model SET is_active=0 WHERE name='Custodian' AND base_model_id='hermes-backend'")
-# carry the friendly description onto the renamed base (id=hermes-backend)
-conn.execute("UPDATE model SET meta=? WHERE id='hermes-backend'", (meta,))
 
 # UPSERT Custodian Images Pipe function (Bug #106 fix)
 pipe_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, 'custodian-images-pipe'))
