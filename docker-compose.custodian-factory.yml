@@ -67,6 +67,9 @@ services:
       # Source: https://docs.openwebui.com/reference/env-configuration/
       #   "Set ENABLE_PERSISTENT_CONFIG=False to force Open WebUI to read variables directly."
       - ENABLE_PERSISTENT_CONFIG=false
+      # Default model (Bug #132) — DB is ignored under ENABLE_PERSISTENT_CONFIG=false,
+      # so the default MUST be set via env. Value is the model ID (renamed to "Custodian").
+      - DEFAULT_MODELS=hermes-backend
       - ENABLE_WEB_SEARCH=true
       - WEB_SEARCH_ENGINE=searxng
       - SEARXNG_QUERY_URL=http://searxng:8080/search?q=<query>
