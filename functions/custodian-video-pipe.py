@@ -11,6 +11,7 @@ import asyncio
 from urllib.parse import quote
 
 from open_webui.routers.images import get_image_config, upload_image
+from open_webui.models.users import UserModel
 
 
 def _first_object(payload):
@@ -131,21 +132,19 @@ class Pipe:
             return "I couldn't create that video. Please try again."
 
         # 4. Persist the video as a real File so it's downloadable (and governed
-        #    by the upload/autodelete cleanup). Fix for Bug #131.
-        metadata = {}
-        if isinstance(__metadata__, dict):
-            chat_id = __metadata__.get("chat_id")
-            message_id = __metadata__.get("message_id")
-            if chat_id and message_id:
-                metadata = {"chat_id": chat_id, "message_id": message_id}
-
+        #    by the upload/autodelete cleanup). Fix for Bug #131 / #133.
         if __request__ is None:
             return "Your video was created, but I couldn't attach it. Please try again."
 
+        # __user__ arrives as a dict (user.model_dump()) in pipe context, but
+        # upload_image()/upload_file_handler() need a UserModel (they read user.id).
+        # Reconstruct it. Empty metadata avoids a double-attach — the files event
+        # below is the single attachment path.
         try:
-            file_item, _ = await upload_image(
-                __request__, video_bytes, "video/mp4", metadata, __user__
-            )
+            user_obj = UserModel(**__user__) if isinstance(__user__, dict) else __user__
+            if user_obj is None:
+                return "Your video was created, but I couldn't attach it. Please try again."
+            file_item, _ = await upload_image(__request__, video_bytes, "video/mp4", {}, user_obj)
         except Exception:
             return "Your video was created, but I couldn't attach it. Please try again."
 

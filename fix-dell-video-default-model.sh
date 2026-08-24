@@ -52,7 +52,9 @@ if [ ! -f "$COMPOSE_FILE" ]; then
 fi
 
 PROJECT="$(docker inspect "$WEBUI_CONTAINER" --format '{{ index .Config.Labels "com.docker.compose.project" }}' 2>/dev/null || true)"
-[ -z "$PROJECT" ] && PROJECT="admin"
+case "$PROJECT" in
+  "" | "<no value>") PROJECT="admin" ;;
+esac
 log "Compose project: $PROJECT"
 
 cp "$COMPOSE_FILE" "${COMPOSE_FILE}.bak-$(date +%Y%m%d-%H%M%S)"
