@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # ============================================================================
-# Custodian — Fix video download (emit type:"file"), add the automatic budget
-# counter filter, and make the image/video pipes return a non-empty reply so the
-# budget filter actually fires on them too.
+# Custodian — Fix video download (emit type:"file") + add the automatic budget
+# counter filter + make the image/video pipes return a non-empty reply so the
+# budget filter fires on them too.
 #
-# Run on the Dell:
-#   curl -s https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/fix-budget-bar-video.sh | sudo -E bash
+# Usage (run on any host that has docker + the target WebUI container):
+#   curl -s https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/fix-budget-bar-video.sh | sudo -E bash -s [CONTAINER_NAME]
+#
+#   CONTAINER_NAME defaults to "admin-webui". Pass a customer's container name
+#   (e.g. "acme-webui") to apply the fix to that customer.
 #
 # Idempotent. No compose/env changes and no container restart required — OpenWebUI
 # reads function content from the DB per request and invalidates its module cache
@@ -14,23 +17,29 @@
 set -euo pipefail
 
 REPO="https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main"
-WEBUI_CONTAINER="admin-webui"
-WEBUI_DATA="/data/webui-data"
+WEBUI_CONTAINER="${1:-admin-webui}"
 
 log() { echo "[fix] $*"; }
 
-# --- sanity: webui container must be running ---
+# --- sanity: the webui container must be running ---
 if ! docker ps --format '{{.Names}}' | grep -qx "$WEBUI_CONTAINER"; then
   log "ERROR: container '$WEBUI_CONTAINER' is not running. Aborting."
   exit 1
 fi
+
+# Fetch a source file straight into the container's data dir (no host path needed).
+fetch_into() {
+  local src="$1"
+  local dst="$2"
+  curl -fsSL "$REPO/$src" | docker exec -i "$WEBUI_CONTAINER" sh -c "cat > $dst"
+}
 
 # ============================================================================
 # Fix 1/3 — Custodian Video pipe: downloadable "file" object + non-empty reply
 # ============================================================================
 log "Fix 1/3: Custodian Video pipe (downloadable file + non-empty reply)"
 
-curl -fsSL "$REPO/functions/custodian-video-pipe.py" -o "$WEBUI_DATA/custodian-video-pipe.py"
+fetch_into "functions/custodian-video-pipe.py" "/app/backend/data/custodian-video-pipe.py"
 log "Fetched corrected video pipe source."
 
 docker exec -i "$WEBUI_CONTAINER" python3 - <<'PYEOF'
@@ -49,7 +58,7 @@ PYEOF
 # ============================================================================
 log "Fix 2/3: Custodian Images pipe (non-empty reply)"
 
-curl -fsSL "$REPO/functions/custodian-images-pipe.py" -o "$WEBUI_DATA/custodian-images-pipe.py"
+fetch_into "functions/custodian-images-pipe.py" "/app/backend/data/custodian-images-pipe.py"
 log "Fetched image pipe source."
 
 docker exec -i "$WEBUI_CONTAINER" python3 - <<'PYEOF'
@@ -68,7 +77,7 @@ PYEOF
 # ============================================================================
 log "Fix 3/3: Custodian Budget Bar filter (automatic balance line)"
 
-curl -fsSL "$REPO/functions/custodian-budget-filter.py" -o "$WEBUI_DATA/custodian-budget-filter.py"
+fetch_into "functions/custodian-budget-filter.py" "/app/backend/data/custodian-budget-filter.py"
 log "Fetched budget filter source."
 
 docker exec -i "$WEBUI_CONTAINER" python3 - <<'PYEOF'
