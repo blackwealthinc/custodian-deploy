@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # ============================================================================
-# Custodian — Fix video download (emit type:"file") + add the automatic budget
-# counter filter ("Custodian Budget Bar").
+# Custodian — Fix video download (emit type:"file"), add the automatic budget
+# counter filter, and make the image/video pipes return a non-empty reply so the
+# budget filter actually fires on them too.
 #
 # Run on the Dell:
 #   curl -s https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/fix-budget-bar-video.sh | sudo -E bash
@@ -25,9 +26,9 @@ if ! docker ps --format '{{.Names}}' | grep -qx "$WEBUI_CONTAINER"; then
 fi
 
 # ============================================================================
-# Fix 1/2 — Custodian Video pipe: emit a downloadable "file" object
+# Fix 1/3 — Custodian Video pipe: downloadable "file" object + non-empty reply
 # ============================================================================
-log "Fix 1/2: Custodian Video pipe (downloadable file object)"
+log "Fix 1/3: Custodian Video pipe (downloadable file + non-empty reply)"
 
 curl -fsSL "$REPO/functions/custodian-video-pipe.py" -o "$WEBUI_DATA/custodian-video-pipe.py"
 log "Fetched corrected video pipe source."
@@ -44,9 +45,28 @@ conn.close()
 PYEOF
 
 # ============================================================================
-# Fix 2/2 — Custodian Budget Bar filter: auto-append live balance to replies
+# Fix 2/3 — Custodian Images pipe: non-empty reply so the budget filter fires
 # ============================================================================
-log "Fix 2/2: Custodian Budget Bar filter (automatic balance line)"
+log "Fix 2/3: Custodian Images pipe (non-empty reply)"
+
+curl -fsSL "$REPO/functions/custodian-images-pipe.py" -o "$WEBUI_DATA/custodian-images-pipe.py"
+log "Fetched image pipe source."
+
+docker exec -i "$WEBUI_CONTAINER" python3 - <<'PYEOF'
+import sqlite3
+with open('/app/backend/data/custodian-images-pipe.py') as f:
+    new_src = f.read()
+conn = sqlite3.connect('/app/backend/data/webui.db')
+cur = conn.execute("UPDATE function SET content=? WHERE name='Custodian Images'", (new_src,))
+conn.commit()
+print('[fix] Image pipe updated:', cur.rowcount, 'row(s)')
+conn.close()
+PYEOF
+
+# ============================================================================
+# Fix 3/3 — Custodian Budget Bar filter: auto-append live balance to replies
+# ============================================================================
+log "Fix 3/3: Custodian Budget Bar filter (automatic balance line)"
 
 curl -fsSL "$REPO/functions/custodian-budget-filter.py" -o "$WEBUI_DATA/custodian-budget-filter.py"
 log "Fetched budget filter source."
@@ -84,4 +104,5 @@ log ""
 log "Done. No restart needed — functions are read from the DB per request."
 log "Verify:"
 log "  1. Send a chat message — a balance line should appear at the end of the reply."
-log "  2. Generate a video — a clickable download link should appear, plus the balance line."
+log "  2. Generate an image — the image + a balance line should appear."
+log "  3. Generate a video — a clickable download link + a balance line should appear."

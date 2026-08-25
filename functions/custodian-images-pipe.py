@@ -2,7 +2,7 @@
 title: Custodian Images
 author: Custodian
 description: Creates an image from your description.
-version: 1.0.0
+version: 1.1.0
 """
 
 from pydantic import BaseModel
@@ -128,4 +128,7 @@ class Pipe:
             )
             await __event_emitter__({"type": "files", "data": {"files": images}})
 
-        return ""
+        # Return a short non-empty confirmation. OpenWebUI only runs outlet
+        # filters (the budget bar) when the response has content — an empty ""
+        # would skip the budget line entirely.
+        return "Image created ✓"

@@ -181,4 +181,7 @@ class Pipe:
                 }
             )
 
-        return ""
+        # Return a short non-empty confirmation. OpenWebUI only runs outlet
+        # filters (the budget bar) when the response has content — an empty ""
+        # would skip the budget line entirely.
+        return "Video created ✓"
