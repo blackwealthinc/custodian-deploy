@@ -2,16 +2,20 @@
 title: Custodian Video
 author: Custodian
 description: Creates a short video from your description.
-version: 1.2.0
+version: 1.3.0
 """
 
 from pydantic import BaseModel
 import aiohttp
 import asyncio
+import io
 from urllib.parse import quote
 
-from open_webui.routers.images import get_image_config, upload_image
+from fastapi import UploadFile
+from open_webui.routers.images import get_image_config
+from open_webui.routers.files import upload_file_handler
 from open_webui.models.users import UserModel
+from open_webui.models.chats import Chats
 
 
 def _first_object(payload):
@@ -132,12 +136,14 @@ class Pipe:
             return "I couldn't create that video. Please try again."
 
         # 4. Persist the video as a real File so it's downloadable (and governed
-        #    by the upload/autodelete cleanup). Fix for Bug #131 / #133.
+        #    by the upload/autodelete cleanup). Fix for Bug #131 / #133 / #137.
         #
         #    __user__ arrives as a dict (user.model_dump()) in pipe context, but
-        #    upload_image()/upload_file_handler() need a UserModel (they read
-        #    user.id). Reconstruct it, then pass the full __metadata__ so the file
-        #    is linked to the chat via insert_chat_files.
+        #    upload_file_handler() needs a UserModel (it reads user.id).
+        #    Reconstruct it. We call upload_file_handler() directly (instead of
+        #    upload_image()) so we can supply a real filename — upload_image()
+        #    hardcodes "generated-image.mp4", which is what the download would
+        #    otherwise be saved as (Bug #137).
         user_obj = None
         try:
             if isinstance(__user__, dict) and __user__.get("id"):
@@ -151,7 +157,32 @@ class Pipe:
         metadata = __metadata__ if isinstance(__metadata__, dict) else {}
 
         try:
-            file_item, url = await upload_image(__request__, video_bytes, "video/mp4", metadata, user_obj)
+            file = UploadFile(
+                file=io.BytesIO(video_bytes),
+                filename="video.mp4",
+                headers={"content-type": "video/mp4"},
+            )
+            file_item = await upload_file_handler(
+                request=__request__,
+                file=file,
+                metadata=metadata,
+                process=False,
+                user=user_obj,
+            )
+
+            # Link the file to the chat message (the same step upload_image()
+            # does) so the video also shows up in the chat's file browser.
+            chat_id = metadata.get("chat_id")
+            message_id = metadata.get("message_id")
+            if file_item and file_item.id and chat_id and message_id:
+                await Chats.insert_chat_files(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    file_ids=[file_item.id],
+                    user_id=user_obj.id,
+                )
+
+            url = __request__.app.url_path_for("get_file_content_by_id", id=file_item.id)
         except Exception:
             return "Your video was created, but I couldn't attach it. Please try again."
 
@@ -173,7 +204,7 @@ class Pipe:
                                 "type": "file",
                                 "id": file_item.id,
                                 "url": url,
-                                "name": "video.mp4",
+                                "name": (file_item.meta or {}).get("name") or "video.mp4",
                                 "size": (file_item.meta or {}).get("size") or len(video_bytes),
                             }
                         ]

@@ -86,7 +86,7 @@ with open('/app/backend/data/custodian-budget-filter.py') as f:
     new_src = f.read()
 meta_json = json.dumps({
     "description": "Automatically shows your live spend after every response.",
-    "manifest": {"name": "Custodian Budget Bar", "version": "1.0.0"},
+    "manifest": {"name": "Custodian Budget Bar", "version": "1.1.0"},
 })
 conn = sqlite3.connect('/app/backend/data/webui.db')
 now = int(time.time())

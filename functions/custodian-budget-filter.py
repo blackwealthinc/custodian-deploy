@@ -2,20 +2,29 @@
 title: Custodian Budget Bar
 author: Custodian
 description: Automatically shows your live spend after every response.
-version: 1.0.0
+version: 1.1.0
 """
 
 from pydantic import BaseModel, Field
 from typing import Optional
+import time
+
 import aiohttp
 
 from open_webui.routers.images import get_image_config
+
+# Module-level TTL cache: api_key -> (expiry_monotonic, formatted_line).
+# OpenWebUI caches the filter module (content-keyed, app-level) and runs a single
+# uvicorn worker, so this dict persists across requests and dedupes /key/info
+# calls across every user in the container (they all share one customer key).
+_BUDGET_CACHE = {}
+_BUDGET_CACHE_TTL = 30.0  # seconds
 
 
 class Filter:
     class Valves(BaseModel):
         priority: int = Field(
-            default=0,
+            default=100,
             description="Runs last so the balance is appended after other filters.",
         )
 
@@ -24,14 +33,20 @@ class Filter:
 
     async def _fetch_budget(self):
         # Read the customer's key + LiteLLM URL from the image config (same source
-        # as chat/images/video — one key = one budget). Reuses the exact logic of
-        # the "Custodian Budget" pipe.
+        # as chat/images/video — one key = one budget).
         image_config = await get_image_config()
         base_url = (image_config.IMAGES_OPENAI_API_BASE_URL or "").rstrip("/")
         api_key = image_config.IMAGES_OPENAI_API_KEY
 
         if not base_url or not api_key:
             return None
+
+        # Serve a recent balance from the cache so we don't hit LiteLLM on every
+        # message (Bug #135). A miss just falls through to a fresh fetch.
+        now = time.monotonic()
+        cached = _BUDGET_CACHE.get(api_key)
+        if cached and cached[0] > now:
+            return cached[1]
 
         # LiteLLM admin endpoints live at the proxy ROOT, not under /v1.
         root = base_url[:-3] if base_url.endswith("/v1") else base_url
@@ -41,7 +56,7 @@ class Filter:
                 async with session.get(
                     f"{root}/key/info",
                     headers={"Authorization": f"Bearer {api_key}"},
-                    timeout=aiohttp.ClientTimeout(total=30),
+                    timeout=aiohttp.ClientTimeout(total=5),
                 ) as response:
                     if response.status != 200:
                         return None
@@ -61,11 +76,14 @@ class Filter:
         if max_budget:
             try:
                 remaining = float(max_budget) - spend
-                return f"\n\n> 💳 **${spend:.2f}** used this month · **${remaining:.2f}** remaining"
+                line = f"\n\n> 💳 **${spend:.2f}** used this month · **${remaining:.2f}** remaining"
             except (TypeError, ValueError):
-                pass
+                line = f"\n\n> 💳 **${spend:.2f}** used this month"
+        else:
+            line = f"\n\n> 💳 **${spend:.2f}** used this month"
 
-        return f"\n\n> 💳 **${spend:.2f}** used this month"
+        _BUDGET_CACHE[api_key] = (now + _BUDGET_CACHE_TTL, line)
+        return line
 
     async def outlet(
         self,
@@ -92,8 +110,11 @@ class Filter:
             content = last.get("content")
             if isinstance(content, str):
                 last["content"] = content + line
-            else:
+            elif not content:
+                # No content yet (None/empty) — just set the balance line.
                 last["content"] = line.strip()
+            # else: non-string content (list/dict) — leave it untouched rather
+            # than clobbering it (Bug #136).
 
             return body
         except Exception:
