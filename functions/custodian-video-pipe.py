@@ -2,7 +2,7 @@
 title: Custodian Video
 author: Custodian
 description: Creates a short video from your description.
-version: 1.1.0
+version: 1.2.0
 """
 
 from pydantic import BaseModel
@@ -133,32 +133,52 @@ class Pipe:
 
         # 4. Persist the video as a real File so it's downloadable (and governed
         #    by the upload/autodelete cleanup). Fix for Bug #131 / #133.
-        if __request__ is None:
+        #
+        #    __user__ arrives as a dict (user.model_dump()) in pipe context, but
+        #    upload_image()/upload_file_handler() need a UserModel (they read
+        #    user.id). Reconstruct it, then pass the full __metadata__ so the file
+        #    is linked to the chat via insert_chat_files.
+        user_obj = None
+        try:
+            if isinstance(__user__, dict) and __user__.get("id"):
+                user_obj = UserModel(**__user__)
+        except Exception:
+            user_obj = None
+
+        if __request__ is None or user_obj is None:
             return "Your video was created, but I couldn't attach it. Please try again."
 
-        # __user__ arrives as a dict (user.model_dump()) in pipe context, but
-        # upload_image()/upload_file_handler() need a UserModel (they read user.id).
-        # Reconstruct it. Empty metadata avoids a double-attach — the files event
-        # below is the single attachment path.
+        metadata = __metadata__ if isinstance(__metadata__, dict) else {}
+
         try:
-            user_obj = UserModel(**__user__) if isinstance(__user__, dict) else __user__
-            if user_obj is None:
-                return "Your video was created, but I couldn't attach it. Please try again."
-            file_item, _ = await upload_image(__request__, video_bytes, "video/mp4", {}, user_obj)
+            file_item, url = await upload_image(__request__, video_bytes, "video/mp4", metadata, user_obj)
         except Exception:
             return "Your video was created, but I couldn't attach it. Please try again."
 
+        # The frontend message renderer only accepts files of type "image" or
+        # "file" (ResponseMessage.svelte filters ['image','file']). "video" is
+        # silently ignored, and a raw FileModelResponse has the wrong shape. Emit
+        # a "file" object carrying the id (FileItemModal resolves the download URL
+        # from item.id), url, name, and size.
         if __event_emitter__ is not None:
             await __event_emitter__(
                 {"type": "status", "data": {"description": "Video created", "done": True}}
             )
-            if hasattr(file_item, "model_dump"):
-                await __event_emitter__(
-                    {"type": "files", "data": {"files": [file_item.model_dump()]}}
-                )
-            elif isinstance(file_item, dict):
-                await __event_emitter__(
-                    {"type": "files", "data": {"files": [file_item]}}
-                )
+            await __event_emitter__(
+                {
+                    "type": "files",
+                    "data": {
+                        "files": [
+                            {
+                                "type": "file",
+                                "id": file_item.id,
+                                "url": url,
+                                "name": "video.mp4",
+                                "size": (file_item.meta or {}).get("size") or len(video_bytes),
+                            }
+                        ]
+                    },
+                }
+            )
 
         return ""
