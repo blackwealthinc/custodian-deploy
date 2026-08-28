@@ -2,7 +2,7 @@
 title: Custodian Video
 author: Custodian
 description: Creates a short video from your description.
-version: 1.3.0
+version: 1.4.0
 """
 
 from pydantic import BaseModel
@@ -36,6 +36,43 @@ class Pipe:
 
     def __init__(self):
         self.valves = self.Valves()
+
+    async def _fetch_budget_line(self) -> str:
+        """Read the customer's live spend from LiteLLM /key/info and format the
+        balance line. Fails closed (empty string) so a LiteLLM outage never breaks
+        the reply. Same source as the budget filter — one key = one budget."""
+        try:
+            image_config = await get_image_config()
+            base_url = (image_config.IMAGES_OPENAI_API_BASE_URL or "").rstrip("/")
+            api_key = image_config.IMAGES_OPENAI_API_KEY
+            if not base_url or not api_key:
+                return ""
+            root = base_url[:-3] if base_url.endswith("/v1") else base_url
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{root}/key/info",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as response:
+                    if response.status != 200:
+                        return ""
+                    data = await response.json()
+            info = data.get("info", data)
+            spend = info.get("spend", 0.0) or 0.0
+            max_budget = info.get("max_budget")
+            try:
+                spend = float(spend)
+            except (TypeError, ValueError):
+                spend = 0.0
+            if max_budget:
+                try:
+                    remaining = float(max_budget) - spend
+                    return f"\n\n> 💳 **${spend:.2f}** used this month · **${remaining:.2f}** remaining"
+                except (TypeError, ValueError):
+                    pass
+            return f"\n\n> 💳 **${spend:.2f}** used this month"
+        except Exception:
+            return ""
 
     async def pipe(
         self,
@@ -186,33 +223,34 @@ class Pipe:
         except Exception:
             return "Your video was created, but I couldn't attach it. Please try again."
 
-        # The frontend message renderer only accepts files of type "image" or
-        # "file" (ResponseMessage.svelte filters ['image','file']). "video" is
-        # silently ignored, and a raw FileModelResponse has the wrong shape. Emit
-        # a "file" object carrying the id (FileItemModal resolves the download URL
-        # from item.id), url, name, and size.
+        # 5. Read the live balance AFTER generation so the spend reflects this
+        #    video (Bug #139 — the budget line must be part of the live reply,
+        #    not appended later by the outlet filter).
+        budget_line = await self._fetch_budget_line()
+
+        # 6. Emit the video as a rich embed so it plays inline (Bug #140).
+        #    v0.11.0 has no native <video> path in the message renderer — the
+        #    "embeds" event renders arbitrary HTML in a sandboxed iframe, and the
+        #    file URL resolves against the WebUI origin when
+        #    DEFAULT_INTERFACE_SETTINGS.iframeSandboxAllowSameOrigin is true
+        #    (set in the compose file alongside the v0.11.1 upgrade).
         if __event_emitter__ is not None:
             await __event_emitter__(
                 {"type": "status", "data": {"description": "Video created", "done": True}}
             )
+            embed_html = (
+                '<div style="max-width:480px;font-family:-apple-system,BlinkMacSystemFont,sans-serif">'
+                f'<video controls preload="metadata" width="100%" src="{url}" '
+                'style="border-radius:12px;background:#000;max-height:420px;width:100%"></video>'
+                '<div style="margin-top:8px;font-size:13px;color:#888">'
+                f'<a href="{url}" download style="color:#4a90d9;text-decoration:none">Download video</a>'
+                "</div></div>"
+            )
             await __event_emitter__(
-                {
-                    "type": "files",
-                    "data": {
-                        "files": [
-                            {
-                                "type": "file",
-                                "id": file_item.id,
-                                "url": url,
-                                "name": (file_item.meta or {}).get("name") or "video.mp4",
-                                "size": (file_item.meta or {}).get("size") or len(video_bytes),
-                            }
-                        ]
-                    },
-                }
+                {"type": "embeds", "data": {"embeds": [embed_html]}}
             )
 
-        # Return a short non-empty confirmation. OpenWebUI only runs outlet
-        # filters (the budget bar) when the response has content — an empty ""
-        # would skip the budget line entirely.
-        return "Video created ✓"
+        # 7. Return a non-empty confirmation carrying the balance line. This is
+        #    the live reply content (shown when the video finishes), so the
+        #    budget appears with the video — no reload required.
+        return f"Video created ✓{budget_line}"

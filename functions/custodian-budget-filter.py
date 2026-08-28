@@ -2,7 +2,7 @@
 title: Custodian Budget Bar
 author: Custodian
 description: Automatically shows your live spend after every response.
-version: 1.1.0
+version: 1.2.0
 """
 
 from pydantic import BaseModel, Field
@@ -109,6 +109,10 @@ class Filter:
 
             content = last.get("content")
             if isinstance(content, str):
+                # If a pipe already emitted the balance line live (Bug #139 fix),
+                # don't append it a second time.
+                if "used this month" in content:
+                    return body
                 last["content"] = content + line
             elif not content:
                 # No content yet (None/empty) — just set the balance line.

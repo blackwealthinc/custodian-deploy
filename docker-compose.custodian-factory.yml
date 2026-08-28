@@ -52,7 +52,7 @@ services:
       - extractor-net
 
   openwebui:
-    image: ghcr.io/open-webui/open-webui:v0.11.0  # pinned — update WEBUI_PINNED_VERSION in setup script too
+    image: ghcr.io/open-webui/open-webui:v0.11.1  # pinned — update WEBUI_PINNED_VERSION in setup script too
     container_name: ${CUSTOMER_ID:-custodian}-webui
     restart: unless-stopped
 
@@ -67,6 +67,9 @@ services:
       # Source: https://docs.openwebui.com/reference/env-configuration/
       #   "Set ENABLE_PERSISTENT_CONFIG=False to force Open WebUI to read variables directly."
       - ENABLE_PERSISTENT_CONFIG=false
+      # Same-origin for chat embeds (Bug #140) — lets the inline video player load
+      # the authenticated file URL /api/v1/files/{id}/content. Requires v0.11.1+.
+      - 'DEFAULT_INTERFACE_SETTINGS={"iframeSandboxAllowSameOrigin": true}'
       # Default model (Bug #132) — DB is ignored under ENABLE_PERSISTENT_CONFIG=false,
       # so the default MUST be set via env. Value is the model ID (renamed to "Custodian").
       - DEFAULT_MODELS=hermes-backend
