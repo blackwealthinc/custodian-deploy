@@ -1,20 +1,26 @@
 #!/usr/bin/env bash
 # ============================================================================
-# Custodian — Fix video inline playback (Bug #140) + live budget (Bug #139)
+# Custodian — video inline playback (#140) + live budget (#139) + dedup (#141)
+#            + video retention & selection message (#143)
 #
-# Two parts, in dependency order:
+# Four parts, in dependency order:
 #
 #   PART 1 — Upgrade OpenWebUI v0.11.0 -> v0.11.1.  v0.11.1 adds the
-#            DEFAULT_INTERFACE_SETTINGS env var (verified in config.py:
-#            `ui.default_interface_settings`), which lets us flip
-#            `iframeSandboxAllowSameOrigin` on system-wide.  That makes the chat
-#            embed iframe same-origin, so the <video> player can load the
-#            authenticated file URL /api/v1/files/{id}/content (cookie is sent).
-#            Without this the video would 401 in the sandboxed iframe.
+#            DEFAULT_INTERFACE_SETTINGS env var, which lets us flip
+#            `iframeSandboxAllowSameOrigin` on system-wide so the <video>
+#            player can load the authenticated file URL (cookie is sent).
 #
 #   PART 2 — Redeploy the Custodian Video / Custodian Images pipes and the
-#            budget filter from this repo (embeds video player, live budget line
-#            in the pipe reply, and a guard so the filter doesn't double-append).
+#            budget filter from this repo (embeds video player, live budget
+#            line, and the #141 dedup guard so a double-fire doesn't mint a
+#            second $0.40 video).
+#
+#   PART 3 — Install the updated cleanup script so generated VIDEOS are also
+#            deleted after 3 days (they were previously "other uploads" = 30d).
+#
+#   PART 4 — Update the customer-facing model description to tell customers to
+#            switch to 'Custodian Video' for videos, and that images AND videos
+#            are kept for 3 days.
 #
 # Usage (run ON THE DELL as root):
 #   curl -s https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/fix-dell-video-budget.sh | sudo -E bash
@@ -192,6 +198,36 @@ conn.close()
 PYEOF
 
 # ════════════════════════════════════════════════════════════════════════════
+# PART 3 — Update the cleanup script: videos now deleted after 3 days (Bug #143)
+# ════════════════════════════════════════════════════════════════════════════
+step "Part 3/4: Update cleanup script (video retention)"
+curl -fsSL "$REPO/custodian-cleanup.sh" -o /usr/local/bin/custodian-cleanup.sh
+chmod +x /usr/local/bin/custodian-cleanup.sh
+log_ok "cleanup script installed — generated videos now removed after 3 days (same as images)"
+
+# ════════════════════════════════════════════════════════════════════════════
+# PART 4 — Update the customer-facing model descriptions to mention videos
+# ════════════════════════════════════════════════════════════════════════════
+step "Part 4/4: Update model descriptions (video selection + retention message)"
+docker exec -i "$WEBUI_CONTAINER" python3 - <<'PYEOF'
+import sqlite3, json
+NEW_DESC = ("Your AI assistant for questions, writing, and everyday help. "
+            "To create images, switch to 'Custodian Images'. "
+            "To create videos, switch to 'Custodian Video'. "
+            "Images and videos are kept for 3 days, then removed automatically.")
+conn = sqlite3.connect('/app/backend/data/webui.db')
+n = 0
+for mid, meta in conn.execute("SELECT id, meta FROM model WHERE name='Custodian'").fetchall():
+    m = json.loads(meta) if meta else {}
+    m['description'] = NEW_DESC
+    conn.execute("UPDATE model SET meta=? WHERE id=?", (json.dumps(m), mid))
+    n += 1
+conn.commit()
+print('[fix] model descriptions updated:', n, 'row(s)')
+conn.close()
+PYEOF
+
+# ════════════════════════════════════════════════════════════════════════════
 # Verify
 # ════════════════════════════════════════════════════════════════════════════
 step "Verify"
@@ -214,4 +250,6 @@ log "Verify in the browser:"
 log "  1. Generate a video — it should play INLINE (video player), with the balance line under it."
 log "  2. Generate an image — image + balance line."
 log "  3. Send a chat message — balance line should appear live at the end (Bug #139)."
+log "  4. Open the model dropdown — 'Custodian' description now mentions 'Custodian Video' + 3-day retention."
+log "  5. (retention) after 3 days, video files in uploads/ are auto-deleted by the hourly cleanup timer."
 log "If the video shows a blank box, confirm DEFAULT_INTERFACE_SETTINGS is present (printed above) and hard-refresh the chat."
