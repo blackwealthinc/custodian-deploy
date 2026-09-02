@@ -2,7 +2,7 @@
 title: Custodian Budget Bar
 author: Custodian
 description: Automatically shows your live spend after every response.
-version: 1.2.0
+version: 1.3.0
 """
 
 from pydantic import BaseModel, Field
@@ -123,3 +123,32 @@ class Filter:
             return body
         except Exception:
             return body
+
+    async def stream(
+        self,
+        event: dict,
+        __user__: Optional[dict] = None,
+        __event_emitter__=None,
+    ) -> dict:
+        # Append the live balance line to the FINAL streaming chunk (Bug #139),
+        # so text chat shows the balance the moment the reply finishes — no
+        # reload required. The outlet filter's "used this month" guard prevents
+        # a double-append on the saved message.
+        try:
+            if not isinstance(event, dict):
+                return event
+            choices = event.get("choices")
+            if not choices:
+                return event
+            choice = choices[0]
+            if choice.get("finish_reason") != "stop":
+                return event
+            line = await self._fetch_budget()
+            if not line:
+                return event
+            delta = choice.get("delta") or {}
+            content = delta.get("content", "")
+            delta["content"] = (content + line) if isinstance(content, str) else line
+            return event
+        except Exception:
+            return event

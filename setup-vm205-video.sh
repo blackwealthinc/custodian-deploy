@@ -50,6 +50,9 @@ cfg["model_list"].append({
         # "gemini/veo-3.1-generate-preview" (Standard) for production output.
         "model": "gemini/veo-3.1-lite-generate-preview",
         "api_key": os.environ["GEMINI_API_KEY"],
+        # Bug #141: never auto-retry a video job — each retry is a fresh $0.40
+        # Veo generation. Set to 0 so a timeout/failure can't duplicate the bill.
+        "num_retries": 0,
     },
 })
 with open(path, "w") as f:

@@ -168,7 +168,7 @@ with open('/app/backend/data/custodian-budget-filter.py') as f:
     new_src = f.read()
 meta_json = json.dumps({
     "description": "Automatically shows your live spend after every response.",
-    "manifest": {"name": "Custodian Budget Bar", "version": "1.2.0"},
+    "manifest": {"name": "Custodian Budget Bar", "version": "1.3.0"},
 })
 conn = sqlite3.connect('/app/backend/data/webui.db')
 now = int(time.time())
@@ -205,8 +205,13 @@ c.close()
 
 echo ""
 log "Done."
+log ""
+log "⚠️  IMPORTANT — hard-refresh your browser NOW:  Ctrl+Shift+R (or Cmd+Shift+R on Mac)."
+log "   This clears the cached frontend from the previous OpenWebUI version."
+log "   Skipping this can cause a black screen / infinite-refresh loop."
+log ""
 log "Verify in the browser:"
 log "  1. Generate a video — it should play INLINE (video player), with the balance line under it."
 log "  2. Generate an image — image + balance line."
-log "  3. Send a chat message — balance line appended at the end."
+log "  3. Send a chat message — balance line should appear live at the end (Bug #139)."
 log "If the video shows a blank box, confirm DEFAULT_INTERFACE_SETTINGS is present (printed above) and hard-refresh the chat."

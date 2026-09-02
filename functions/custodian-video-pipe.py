@@ -2,13 +2,14 @@
 title: Custodian Video
 author: Custodian
 description: Creates a short video from your description.
-version: 1.4.0
+version: 1.5.0
 """
 
 from pydantic import BaseModel
 import aiohttp
 import asyncio
 import io
+import time
 from urllib.parse import quote
 
 from fastapi import UploadFile
@@ -16,6 +17,19 @@ from open_webui.routers.images import get_image_config
 from open_webui.routers.files import upload_file_handler
 from open_webui.models.users import UserModel
 from open_webui.models.chats import Chats
+
+
+# Dedup guard (Bug #141): OpenWebUI re-fires the pipe for the same message
+# (a double-fire + timeout retries), which previously minted a fresh $0.40
+# Veo generation each time. OpenWebUI runs a single uvicorn worker
+# (--workers 1) and caches the function module, so this module-level dict
+# persists and is shared across concurrent requests.
+_VIDEO_JOBS = {}          # key -> {"event": asyncio.Event, "result": str, "expires": float}
+_VIDEO_JOB_TTL = 90.0     # seconds a completed result stays cached
+
+
+def _job_key(chat_id, prompt):
+    return (chat_id, prompt)
 
 
 def _first_object(payload):
@@ -82,6 +96,9 @@ class Pipe:
         __request__=None,
         __metadata__=None,
     ):
+        metadata = __metadata__ if isinstance(__metadata__, dict) else {}
+        chat_id = metadata.get("chat_id")
+
         # 1. Pull the user's latest prompt out of the message list.
         prompt = ""
         for message in reversed(body.get("messages", [])):
@@ -101,13 +118,58 @@ class Pipe:
         if not prompt:
             return "Tell me what you'd like me to create, and I'll make a short video of it."
 
+        # 2. Dedup guard (Bug #141): if this exact message is already generating
+        #    (or just finished), reuse the result instead of paying again.
+        key = _job_key(chat_id, prompt)
+        job = _VIDEO_JOBS.get(key)
+        if job is not None:
+            if not job["event"].is_set():
+                # A concurrent invocation is still running — wait and reuse.
+                await job["event"].wait()
+                return job["result"]
+            if job["expires"] > time.monotonic():
+                # Recently completed — reuse the cached result.
+                return job["result"]
+            # else: expired — fall through and regenerate.
+
+        # Register this job atomically (no await between the check above and
+        # this registration, so a double-fire can't slip past).
+        event = asyncio.Event()
+        _VIDEO_JOBS[key] = {"event": event, "result": None, "expires": 0.0}
+
+        try:
+            result = await self._generate_video(
+                body, __event_emitter__, __user__, __request__, __metadata__, prompt
+            )
+        except Exception:
+            _VIDEO_JOBS.pop(key, None)
+            event.set()  # release any waiters
+            raise
+
+        _VIDEO_JOBS[key] = {
+            "event": event,
+            "result": result,
+            "expires": time.monotonic() + _VIDEO_JOB_TTL,
+        }
+        event.set()
+        return result
+
+    async def _generate_video(
+        self, body, __event_emitter__, __user__, __request__, __metadata__, prompt
+    ):
         if __event_emitter__ is not None:
             await __event_emitter__(
-                {"type": "status", "data": {"description": "Creating your video… this usually takes about a minute.", "done": False}}
+                {
+                    "type": "status",
+                    "data": {
+                        "description": "Creating your video… this usually takes about a minute.",
+                        "done": False,
+                    },
+                }
             )
 
-        # 2. Read the customer's key + LiteLLM URL from the image config
-        #    (same source as images/vision — one key = one budget).
+        # Read the customer's key + LiteLLM URL from the image config
+        # (same source as images/vision — one key = one budget).
         image_config = await get_image_config()
         base_url = (image_config.IMAGES_OPENAI_API_BASE_URL or "").rstrip("/")
         api_key = image_config.IMAGES_OPENAI_API_KEY
@@ -115,13 +177,16 @@ class Pipe:
         if not base_url or not api_key:
             return "Video isn't configured yet. Please try again shortly."
 
-        # 3. Generate the video through LiteLLM (unified /videos surface).
+        # Generate the video through LiteLLM (unified /videos surface).
         video_bytes = None
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     f"{base_url}/videos",
-                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
                     json={
                         "model": self.valves.MODEL,
                         "prompt": prompt,
@@ -172,15 +237,8 @@ class Pipe:
         if not video_bytes:
             return "I couldn't create that video. Please try again."
 
-        # 4. Persist the video as a real File so it's downloadable (and governed
-        #    by the upload/autodelete cleanup). Fix for Bug #131 / #133 / #137.
-        #
-        #    __user__ arrives as a dict (user.model_dump()) in pipe context, but
-        #    upload_file_handler() needs a UserModel (it reads user.id).
-        #    Reconstruct it. We call upload_file_handler() directly (instead of
-        #    upload_image()) so we can supply a real filename — upload_image()
-        #    hardcodes "generated-image.mp4", which is what the download would
-        #    otherwise be saved as (Bug #137).
+        # Persist the video as a real File so it's downloadable (and governed
+        # by the upload/autodelete cleanup). Fix for Bug #131 / #133 / #137.
         user_obj = None
         try:
             if isinstance(__user__, dict) and __user__.get("id"):
@@ -223,17 +281,11 @@ class Pipe:
         except Exception:
             return "Your video was created, but I couldn't attach it. Please try again."
 
-        # 5. Read the live balance AFTER generation so the spend reflects this
-        #    video (Bug #139 — the budget line must be part of the live reply,
-        #    not appended later by the outlet filter).
+        # Read the live balance AFTER generation so the spend reflects this
+        # video (Bug #139 — the budget line must be part of the live reply).
         budget_line = await self._fetch_budget_line()
 
-        # 6. Emit the video as a rich embed so it plays inline (Bug #140).
-        #    v0.11.0 has no native <video> path in the message renderer — the
-        #    "embeds" event renders arbitrary HTML in a sandboxed iframe, and the
-        #    file URL resolves against the WebUI origin when
-        #    DEFAULT_INTERFACE_SETTINGS.iframeSandboxAllowSameOrigin is true
-        #    (set in the compose file alongside the v0.11.1 upgrade).
+        # Emit the video as a rich embed so it plays inline (Bug #140).
         if __event_emitter__ is not None:
             await __event_emitter__(
                 {"type": "status", "data": {"description": "Video created", "done": True}}
@@ -250,7 +302,5 @@ class Pipe:
                 {"type": "embeds", "data": {"embeds": [embed_html]}}
             )
 
-        # 7. Return a non-empty confirmation carrying the balance line. This is
-        #    the live reply content (shown when the video finishes), so the
-        #    budget appears with the video — no reload required.
+        # Return a non-empty confirmation carrying the balance line.
         return f"Video created ✓{budget_line}"
