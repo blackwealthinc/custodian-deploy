@@ -29,6 +29,11 @@ _VIDEO_JOB_TTL = 90.0     # seconds a completed result stays cached
 
 
 def _job_key(chat_id, prompt):
+    # Keyed on (chat_id, prompt) so the same re-fired message AND its timeout
+    # retries (same prompt, same chat, within ~90s) all collapse to one job.
+    # Tradeoff: a *deliberate* re-generation of the same prompt within 90s also
+    # reuses the cached result — acceptable given the short TTL, and it's the
+    # safe choice vs. missing a duplicate that costs real money.
     return (chat_id, prompt)
 
 
@@ -135,7 +140,8 @@ class Pipe:
         # Register this job atomically (no await between the check above and
         # this registration, so a double-fire can't slip past).
         event = asyncio.Event()
-        _VIDEO_JOBS[key] = {"event": event, "result": None, "expires": 0.0}
+        job = {"event": event, "result": None, "expires": 0.0}
+        _VIDEO_JOBS[key] = job
 
         try:
             result = await self._generate_video(
@@ -146,11 +152,12 @@ class Pipe:
             event.set()  # release any waiters
             raise
 
-        _VIDEO_JOBS[key] = {
-            "event": event,
-            "result": result,
-            "expires": time.monotonic() + _VIDEO_JOB_TTL,
-        }
+        # Mutate the SAME dict (do NOT replace it). A concurrent invocation that
+        # already grabbed `job` above and is awaiting the event reads job["result"]
+        # after it wakes — replacing the dict here would leave it holding a stale
+        # reference whose "result" is still None.
+        job["result"] = result
+        job["expires"] = time.monotonic() + _VIDEO_JOB_TTL
         event.set()
         return result
 
