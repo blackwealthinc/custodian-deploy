@@ -2,7 +2,7 @@
 title: Custodian Budget Bar
 author: Custodian
 description: Automatically shows your live spend after every response.
-version: 1.4.0
+version: 1.5.0
 """
 
 from pydantic import BaseModel, Field
@@ -131,10 +131,17 @@ class Filter:
         __event_emitter__=None,
     ) -> dict:
         # Surface the balance line live when the reply finishes (Bug #144).
-        # Mutating the final chunk's delta never reached the live output — the
-        # line only landed in the saved content via the outlet filter, so it
-        # showed up only after a reload. Emit through __event_emitter__ instead,
-        # the same live channel the video pipe uses to surface content.
+        #
+        # The line must land INSIDE the model's "output" (Responses API), not as
+        # a side-stream "message" event. The frontend's chatCompletionEventHandler
+        # runs `message.content = getOutputText(output)` on the final
+        # chat:completion event, which wipes any content appended via
+        # __event_emitter__("message"). Anything folded into the output survives.
+        #
+        # v1.3.0's delta mutation was the right idea but had a silent bug:
+        # `delta = choice.get("delta") or {}` — the finish chunk has delta={}
+        # (falsy), so `or {}` returned a NEW throwaway dict and the mutation
+        # never touched choice["delta"]. Mutate choice["delta"] directly instead.
         try:
             if not isinstance(event, dict):
                 return event
@@ -147,8 +154,12 @@ class Filter:
             line = await self._fetch_budget()
             if not line:
                 return event
-            if __event_emitter__ is not None:
-                await __event_emitter__({"type": "message", "data": {"content": line}})
+            delta = choice.get("delta")
+            if delta is None:
+                delta = {}
+                choice["delta"] = delta
+            content = delta.get("content", "")
+            delta["content"] = (content + line) if isinstance(content, str) else line
             return event
         except Exception:
             return event
