@@ -200,8 +200,6 @@ model_list:
     litellm_params:
       model: openai/gpt-image-2
       api_key: ${!_OAI_VN}
-      quality: auto
-      size: 1024x1024
 
 litellm_settings:
   drop_params: true
