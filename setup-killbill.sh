@@ -244,14 +244,14 @@ log_ok "Containers started"
 log_step "Step 6: Health Check"
 
 # Wait for the engine (Java/Tomcat — takes a minute or two on first boot).
-# NOTE: we deliberately do NOT use /1.0/healthcheck here — Kill Bill starts
-# "out of rotation" (a load-balancer signal) and only reports healthy after a
-# manual putInRotation() via PUT /1.0/kb/admin/healthcheck. The definitive
-# ready-signal is Tomcat's log line: "Server startup in N ms".
+# The readiness signal is GET /1.0/healthcheck: it returns HTTP 200 ("healthy")
+# only once the server has fully started AND put itself in rotation — which
+# Kill Bill does automatically at startup (KillbillGuiceFilter.init() calls
+# putInRotation(); no manual PUT is needed). Returns 500 while still starting.
 ENGINE_READY=false
 for i in $(seq 1 50); do
-    if docker logs killbill 2>&1 | grep -q "Server startup"; then
-        log_ok "Kill Bill engine ready — Tomcat 'Server startup' detected (attempt $i)"
+    if curl -sf "http://localhost:${KILLBILL_PORT}/1.0/healthcheck" >/dev/null 2>&1; then
+        log_ok "Kill Bill engine ready — /1.0/healthcheck returned 200 OK (attempt $i)"
         ENGINE_READY=true
         break
     fi
@@ -259,6 +259,8 @@ for i in $(seq 1 50); do
 done
 if [ "$ENGINE_READY" = false ]; then
     log_error "Kill Bill engine did not become ready after ~5 minutes"
+    log_info "Healthcheck response:"
+    curl -s "http://localhost:${KILLBILL_PORT}/1.0/healthcheck" || true
     log_info "Recent logs:"
     docker logs killbill --tail 40 || true
     exit 1
