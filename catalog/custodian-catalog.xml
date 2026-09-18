@@ -1,0 +1,133 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!--
+  Custodian reseller catalog — Kill Bill standalone catalog.
+
+  PRICING SOURCE: features/killbill-integration-master-plan.md §3
+    "Retail (customer pays): $20 / $59 / $200  (re-priced Aug 17, 2026)"
+  These are RETAIL prices — what the CUSTOMER is charged. They are deliberately
+  NOT the cost budgets pushed to LiteLLM (basic 5 / pro 20 / business 100 in
+  kb-bridge's `plans` table). The margin lives between the two; see §3.
+  Plan names are kept identical to kb-bridge's plan names (basic/pro/business)
+  so the retail->cost-budget mapping is legible to a human reading either side.
+
+  Shape follows Kill Bill's own catalog examples at tag killbill-0.24.21
+  (beatrix/src/test/resources/catalogs/...), validated against catalog.xsd.
+
+  All three plans: monthly, billed IN_ADVANCE, EVERGREEN (no trial, no fixed
+  term) so that subscribing immediately generates a real, chargeable invoice —
+  which is what the end-to-end payment test needs.
+-->
+<catalog xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:noNamespaceSchemaLocation="https://docs.killbill.io/latest/catalog.xsd">
+
+  <effectiveDate>2026-01-01T00:00:00+00:00</effectiveDate>
+  <catalogName>CustodianCatalog</catalogName>
+  <recurringBillingMode>IN_ADVANCE</recurringBillingMode>
+
+  <currencies>
+    <currency>USD</currency>
+  </currencies>
+
+  <units>
+  </units>
+
+  <products>
+    <product name="custodian">
+      <category>BASE</category>
+    </product>
+  </products>
+
+  <rules>
+    <changePolicy>
+      <changePolicyCase>
+        <policy>IMMEDIATE</policy>
+      </changePolicyCase>
+    </changePolicy>
+    <cancelPolicy>
+      <cancelPolicyCase>
+        <policy>IMMEDIATE</policy>
+      </cancelPolicyCase>
+    </cancelPolicy>
+  </rules>
+
+  <plans>
+
+    <!-- basic — retail $20/mo  (cost budget pushed to LiteLLM: $5) -->
+    <plan name="basic">
+      <product>custodian</product>
+      <recurringBillingMode>IN_ADVANCE</recurringBillingMode>
+      <initialPhases>
+      </initialPhases>
+      <finalPhase type="EVERGREEN">
+        <duration>
+          <unit>UNLIMITED</unit>
+        </duration>
+        <recurring>
+          <billingPeriod>MONTHLY</billingPeriod>
+          <recurringPrice>
+            <price>
+              <currency>USD</currency>
+              <value>20</value>
+            </price>
+          </recurringPrice>
+        </recurring>
+      </finalPhase>
+    </plan>
+
+    <!-- pro — retail $59/mo  (cost budget pushed to LiteLLM: $20) -->
+    <plan name="pro">
+      <product>custodian</product>
+      <recurringBillingMode>IN_ADVANCE</recurringBillingMode>
+      <initialPhases>
+      </initialPhases>
+      <finalPhase type="EVERGREEN">
+        <duration>
+          <unit>UNLIMITED</unit>
+        </duration>
+        <recurring>
+          <billingPeriod>MONTHLY</billingPeriod>
+          <recurringPrice>
+            <price>
+              <currency>USD</currency>
+              <value>59</value>
+            </price>
+          </recurringPrice>
+        </recurring>
+      </finalPhase>
+    </plan>
+
+    <!-- business — retail $200/mo  (cost budget pushed to LiteLLM: $100) -->
+    <plan name="business">
+      <product>custodian</product>
+      <recurringBillingMode>IN_ADVANCE</recurringBillingMode>
+      <initialPhases>
+      </initialPhases>
+      <finalPhase type="EVERGREEN">
+        <duration>
+          <unit>UNLIMITED</unit>
+        </duration>
+        <recurring>
+          <billingPeriod>MONTHLY</billingPeriod>
+          <recurringPrice>
+            <price>
+              <currency>USD</currency>
+              <value>200</value>
+            </price>
+          </recurringPrice>
+        </recurring>
+      </finalPhase>
+    </plan>
+
+  </plans>
+
+  <priceLists>
+    <defaultPriceList name="DEFAULT">
+      <plans>
+        <plan>basic</plan>
+        <plan>pro</plan>
+        <plan>business</plan>
+      </plans>
+    </defaultPriceList>
+  </priceLists>
+
+</catalog>
