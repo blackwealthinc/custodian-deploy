@@ -29,12 +29,13 @@ Four facts from the Kill Bill source (tag `killbill-0.24.21`, the version on `.1
 **1. Kill Bill makes the HTTP call itself, synchronously, on its event-bus thread, with a 15-second timeout.**
 `PushNotificationListener.triggerPushNotifications` is `@Subscribe` + `@AllowConcurrentEvents` and calls `doPost(..., TIMEOUT_NOTIFICATION, 0)` directly; `TIMEOUT_NOTIFICATION = 15`. The official docs' own sample log shows the thread name `th='bus_events-th'`.
 
-**2. And there may be only ONE bus thread.** Kill Bill's shipped config sets:
+**2. And there is only ONE bus thread — measured on `.104`, not inferred.** Kill Bill's shipped config sets:
 ```
 org.killbill.persistent.bus.main.nbThreads=1
 org.killbill.persistent.bus.main.queue.capacity=1000
 ```
-Our deploy does not override it. So a stalled callback cannot just slow one worker — it can **stop all event dispatch**. This is why the receiver's latency ceiling is treated as a hard safety property, not a performance nicety.
+Confirmed against the running container: the only `KB_*` bus override present is
+`KB_org_killbill_notificationq_main_queue_mode=POLLING` — `nbThreads` is untouched. So a stalled callback cannot just slow one worker — it can **stop all event dispatch**. This is why the receiver's latency ceiling is treated as a hard safety property, not a performance nicety.
 
 > The receiver therefore does nothing but persist and ACK. The fast path, and the two guards that keep it fast, are described under *Receiver hardening* below.
 
@@ -120,6 +121,8 @@ GET /1.0/kb/invoices/pagination?offset=N&limit=100&audit=true
 
 A `sweep_last_invoice_number` watermark avoids re-processing. **The watermark is only advanced when the walk completes** — on a truncated walk (page cap reached) it is deliberately left alone, because advancing on a partial scan would skip every invoice past the cap permanently. Re-scanning is cheap since `enqueue()` de-duplicates.
 
+**Do not send `audit` to this endpoint.** The swagger lists `audit` as an optional query param, but the live engine returns **404 with an HTML Tomcat page** for any value of it. Verified by isolation on `.104` (order and value both irrelevant). Spec ≠ implementation.
+
 ## Config — `/opt/kb-bridge/kb-bridge.env` (mode 600)
 
 | Variable | Default | Notes |
@@ -170,16 +173,46 @@ The first version of this bridge passed 9/9 and was still wrong in three places.
 
 Also fixed: the receiver stalled 5 s under a 60-request burst with 15% failures; the sweep's synthetic `tenantId` broke de-duplication against the webhook path; and the receiver spawned unbounded threads under a `MemoryMax` cap.
 
+4. **A fourth one, found only by wiring it up:** the sweep sent `audit=true` to `/1.0/kb/invoices/pagination`, and the live engine answers that with a **404 HTML page**. The swagger says `audit` is an optional param here. It is not. Nothing caught this until the sweep ran against the real engine — the mock had been too permissive, and has since been made to reproduce the 404 so the suite can catch it.
+
+### Live wiring (2026-09-18)
+
+Tenant `custodian` (externalKey `custodian-demo`) created on `.104` via `POST /1.0/kb/tenants`, id `fc46a7f4-1631-463d-b03e-dc35266724ad`. The callback was registered on it, and **Kill Bill delivered a real event**:
+
+```
+recv eventType=TENANT_CONFIG_CHANGE objectId=0374349f-... fresh=True
+worker -> status=skipped  "not actionable: TENANT_CONFIG_CHANGE"   (correct)
+```
+
+That exercises the whole path: Kill Bill → `192.168.50.205:8555` → SQLite queue → worker. The sweep also ran live for the first time (`pages=1 scanned=0 new=0`), authenticating and completing against the real engine.
+
+**The one-callback-per-tenant claim is now proven live**, on a real tenant:
+
+| Action | Result |
+|---|---|
+| register URL ONE → GET | 1 value = URL ONE |
+| register URL TWO → GET | 1 value = **URL TWO** — replaced, not appended |
+| re-register the same URL twice | still 1 entry (provisioning is idempotent) |
+| DELETE → GET | `204`, then `[]` — clears the whole key |
+
+### Kill Bill gotchas discovered by doing it
+
+- **A tenant's `apiSecret` is unrecoverable.** The API returns `apiSecret: null` on read, and the DB stores a salted hash (measured: 88-char hash + 24-char salt). Lose it and the tenant is orphaned forever — there is no tenant DELETE. **Persist the secret the instant the create returns.**
+- **The tenant cache is in-memory and goes stale.** Deleting rows behind the engine's back leaves it serving a deleted tenant, and that stale entry makes re-creating the same api key return `409`. `DELETE /1.0/kb/admin/cache/tenants` only works **once a valid tenant context exists** (root basic auth alone gets `401`); otherwise a `docker restart killbill` flushes it.
+- **`useGlobalDefault` on tenant create** defaults to `false`, giving the tenant an explicit *empty* catalog (`catalogUserApi.createDefaultEmptyCatalog`). Uploading our own catalog works either way, so the default is the clean state.
+- Root API auth here is `admin:password` (shiro.ini: `admin = password, root`; role `root = *:*`). Our compose sets no auth config, so these are image defaults.
+
 ## Known gaps
 
 - **`SUBSCRIPTION_CHANGE` is not handled.** Deciding the new budget needs a subscription→plan lookup against Kill Bill. Until that exists a plan change leaves the budget at the old value until the next payment. It is marked `skipped` with an explicit reason rather than silently ignored.
-- **The bus thread count is inferred, not measured on `.104`.** Upstream's shipped default is `nbThreads=1` and our deploy sets nothing, but the running container's effective config has not been read directly (no SSH access to `.104` at time of writing).
-- **One live proof is still owed:** that a tenant has exactly ONE callback URL. Proven at four code layers, but not yet observed on a real tenant — `/1.0/kb/tenants/{tenantId}` has no DELETE, so a throwaway tenant would be permanent.
+- **Per-tenant credentials are not modelled.** `KB_KILLBILL_*` is a single credential set, which is fine for one tenant. With several resellers, each tenant needs its own credentials for verification and sweeping — and `NotificationJson` carries **no `tenantId`**, so the webhook alone cannot say which tenant sent it. The intended fix is a **per-tenant callback URL**: register `…/kb/events/<tenant-specific-token>` with each tenant's credentials, so the path identifies the tenant. One URL per tenant already, so this costs nothing architecturally.
+- **The bridge's `:8555` is still open to the LAN.** Firewall to the Kill Bill host, and **REJECT, not DROP**.
 
 ## Still to do
 
-1. **Create the tenant on `.104`**, then fill in `KB_KILLBILL_*` → verification and the sweep go live.
-2. **Register the callback per tenant** and confirm one URL per tenant live.
-3. **Firewall `:8555`** to the Kill Bill host only. It must **REJECT, not DROP** — a dropped packet makes Kill Bill wait the full 15 s, whereas a refused connection costs nothing.
-4. **Set the real plan budgets** — the seeded `basic 5 / pro 20 / business 100` are placeholders.
+1. **Author and upload the Kill Bill catalog** — the tenant currently has an empty one, so no subscription or invoice can exist yet. Validate with `POST /1.0/kb/catalog/xml/validate` before uploading.
+2. **Set the real plan budgets** — the seeded `basic 5 / pro 20 / business 100` are placeholders, and `plans` maps a Kill Bill plan name to a dollar ceiling.
+3. **Map accounts** once accounts exist: `kb_bridge.py map --account-id <uuid> --budget-id <litellm-budget>`.
+4. **Firewall `:8555`.**
 5. **Decide `KB_BUDGET_DURATION`** (monthly reset) once pricing is settled.
+6. **Add the per-tenant credential model** before onboarding a second reseller.

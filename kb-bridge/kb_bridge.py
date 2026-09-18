@@ -692,9 +692,13 @@ def run_sweep(once: bool = False) -> int:
                 # INVOICES, not payments. A Payment object has no `status` and no
                 # `invoiceId` (verified against definitions/Payment), so the
                 # earlier payment-based sweep silently matched nothing, forever.
+                #
+                # NO `audit` PARAM: the swagger lists `audit` as optional here but
+                # the live engine returns 404 (an HTML Tomcat page) for any value
+                # of it -- verified by isolation on .104. Spec != implementation.
                 status, resp = http_json(
                     "GET",
-                    f"{KILLBILL_URL}/1.0/kb/invoices/pagination?offset={offset}&limit=100&audit=true",
+                    f"{KILLBILL_URL}/1.0/kb/invoices/pagination?offset={offset}&limit=100",
                     None,
                     killbill_headers(),
                 )
