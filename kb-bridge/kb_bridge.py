@@ -693,9 +693,18 @@ def run_sweep(once: bool = False) -> int:
                 # `invoiceId` (verified against definitions/Payment), so the
                 # earlier payment-based sweep silently matched nothing, forever.
                 #
-                # NO `audit` PARAM: the swagger lists `audit` as optional here but
-                # the live engine returns 404 (an HTML Tomcat page) for any value
-                # of it -- verified by isolation on .104. Spec != implementation.
+                # NO `audit` PARAM -- deliberately omitted.
+                #
+                # CORRECTED (2026-09-18): an earlier comment here claimed
+                # "spec != implementation". That was WRONG. `audit` is not a
+                # string, it is an enum:
+                #     @QueryParam(QUERY_AUDIT) @DefaultValue("NONE") AuditMode
+                # and AuditMode does AuditLevel.valueOf(str.toUpperCase()).
+                # An invalid value throws during JAX-RS parameter conversion and
+                # the spec REQUIRES a 404 for that. So the 404 was correct
+                # behaviour, not a Kill Bill bug, and the param is usable as
+                # audit=NONE|FULL|MINIMAL (all confirmed 200 live on .104).
+                # We omit it because NONE is already the default.
                 status, resp = http_json(
                     "GET",
                     f"{KILLBILL_URL}/1.0/kb/invoices/pagination?offset={offset}&limit=100",

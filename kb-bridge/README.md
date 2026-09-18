@@ -121,7 +121,31 @@ GET /1.0/kb/invoices/pagination?offset=N&limit=100&audit=true
 
 A `sweep_last_invoice_number` watermark avoids re-processing. **The watermark is only advanced when the walk completes** — on a truncated walk (page cap reached) it is deliberately left alone, because advancing on a partial scan would skip every invoice past the cap permanently. Re-scanning is cheap since `enqueue()` de-duplicates.
 
-**Do not send `audit` to this endpoint.** The swagger lists `audit` as an optional query param, but the live engine returns **404 with an HTML Tomcat page** for any value of it. Verified by isolation on `.104` (order and value both irrelevant). Spec ≠ implementation.
+**About `audit` — corrected 2026-09-18.** An earlier version of this file said
+"Spec ≠ implementation" and told you never to send `audit`. **That was wrong.**
+
+`audit` is not a string. It is an enum:
+
+```java
+@QueryParam(QUERY_AUDIT) @DefaultValue("NONE") final AuditMode auditMode
+// AuditMode: this.level = AuditLevel.valueOf(auditModeString.toUpperCase());
+```
+
+An invalid value throws during JAX-RS parameter conversion, and the JAX-RS spec
+**requires a 404** in that case. So the 404 was correct behaviour — not a Kill
+Bill bug. Measured live on `.104`:
+
+```
+audit=NONE  -> 200      audit=true  -> 404
+audit=FULL  -> 200      audit=1     -> 404
+audit=MINIMAL -> 200    audit=bogus -> 404
+audit= (empty) -> 200   (empty skips conversion, falls back to @DefaultValue)
+```
+
+Two consequences worth keeping: the parameter is perfectly **usable** as
+`audit=NONE|FULL|MINIMAL`, and this is **not endpoint-specific** — 64 live
+endpoints declare `audit` and all behave identically. We simply omit it,
+because `NONE` is already the default.
 
 ## Config — `/opt/kb-bridge/kb-bridge.env` (mode 600)
 
@@ -173,7 +197,9 @@ The first version of this bridge passed 9/9 and was still wrong in three places.
 
 Also fixed: the receiver stalled 5 s under a 60-request burst with 15% failures; the sweep's synthetic `tenantId` broke de-duplication against the webhook path; and the receiver spawned unbounded threads under a `MemoryMax` cap.
 
-4. **A fourth one, found only by wiring it up:** the sweep sent `audit=true` to `/1.0/kb/invoices/pagination`, and the live engine answers that with a **404 HTML page**. The swagger says `audit` is an optional param here. It is not. Nothing caught this until the sweep ran against the real engine — the mock had been too permissive, and has since been made to reproduce the 404 so the suite can catch it.
+4. **A fourth one, found only by wiring it up:** the sweep sent `audit=true` to `/1.0/kb/invoices/pagination`, and the live engine answers that with a **404 HTML page**. Nothing caught this until the sweep ran against the real engine — the mock had been too permissive, and has since been made to reproduce the 404 so the suite can catch it.
+
+   **The cause I gave at the time was wrong, and is corrected above** (see §"About `audit`"). The 404 is *correct* JAX-RS behaviour for an invalid enum value, not a Kill Bill defect, and `audit=NONE|FULL|MINIMAL` all return 200. Worth keeping as a lesson about *two* different failures at once: the sweep really was broken, but my explanation of why was a confident guess that survived because the fix worked either way. A fix that works for the wrong reason is not a verified fix.
 
 ### Live wiring (2026-09-18)
 
