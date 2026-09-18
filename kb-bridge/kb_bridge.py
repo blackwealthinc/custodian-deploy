@@ -48,6 +48,7 @@ import os
 import signal
 import sqlite3
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -119,6 +120,24 @@ BATCH = int(cfg("KB_WORKER_BATCH", "10"))
 POLL_SECONDS = float(cfg("KB_WORKER_POLL_SECONDS", "2"))
 MAX_ATTEMPTS = int(cfg("KB_MAX_ATTEMPTS", "8"))
 HTTP_TIMEOUT = float(cfg("KB_HTTP_TIMEOUT", "20"))
+SWEEP_MAX_PAGES = int(cfg("KB_SWEEP_MAX_PAGES", "20"))
+SWEEP_INTERVAL_SECONDS = float(cfg("KB_SWEEP_INTERVAL_SECONDS", "900"))
+
+# --- receiver hardening ---------------------------------------------------- #
+# The receiver must NEVER park a Kill Bill event-bus thread. Kill Bill's shipped
+# bus config is `persistent.bus.main.nbThreads=1`, so a stalled callback can stop
+# ALL event dispatch. Two guards:
+#   * a SHORT sqlite busy timeout -> a blocked write fails fast (500 -> retry)
+#     instead of waiting seconds (measured 5.02 s at the 5000 ms default)
+#   * a bounded concurrency slot -> shed load with 503 rather than spawning an
+#     unbounded thread per connection under MemoryMax
+RECV_BUSY_TIMEOUT_MS = int(cfg("KB_RECV_BUSY_TIMEOUT_MS", "250"))
+MAX_CONCURRENT = int(cfg("KB_MAX_CONCURRENT", "32"))
+# Wait this long for a free slot before shedding. 0 would shed the very first
+# burst instantly; a small wait absorbs a spike while still bounding the worst
+# case (wait + busy timeout ~= 0.4 s, versus Kill Bill's 15 s budget).
+RECV_SLOT_WAIT_SECONDS = float(cfg("KB_RECV_SLOT_WAIT_SECONDS", "0.15"))
+_SLOTS = threading.BoundedSemaphore(MAX_CONCURRENT)
 
 # Event types we act on. Anything else is acknowledged and marked 'skipped'.
 ACTION_PAYMENT = "INVOICE_PAYMENT_SUCCESS"
@@ -169,10 +188,21 @@ CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 """
 
 
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=30.0, isolation_level=None)
+def db(busy_ms: int = 5000) -> sqlite3.Connection:
+    """Open the queue database.
+
+    busy_ms is the SQLite busy timeout. The RECEIVER deliberately passes a short
+    one: if the worker holds the write lock it must fail fast so Kill Bill gets a
+    quick 500 (and retries) instead of having an event-bus thread parked for
+    seconds. The worker keeps a long timeout because it is the primary writer.
+    """
+    conn = sqlite3.connect(DB_PATH, timeout=busy_ms / 1000.0, isolation_level=None)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=5000")
+    # NOTE: journal_mode=WAL is PERSISTENT in the database file, so it is set once
+    # by init_db(). Re-issuing it on every open is measurable work under a burst.
+    # synchronous is per-connection (default FULL = fsync per commit) so it stays.
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute(f"PRAGMA busy_timeout={int(busy_ms)}")
     return conn
 
 
@@ -262,9 +292,20 @@ def killbill_configured() -> bool:
 
 
 def killbill_verify_invoice_paid(account_id: str, invoice_id: str) -> tuple[bool, str]:
-    """Re-verify a claimed payment against Kill Bill. Fail closed."""
+    """Re-verify a claimed payment against Kill Bill. Fail closed.
+
+    Field names verified against the live swagger `definitions/Invoice`:
+      * status  : enum DRAFT | COMMITTED | VOID   -- there is NO "PAID" status
+      * balance : number, 0.0 == fully paid
+      * there is NO `paidAmount` field anywhere in the Kill Bill API.
+        An earlier version of this function read it, so every verification
+        failed and every payment event was refused.
+    """
     if not killbill_configured():
         return False, "killbill credentials not configured (fail-closed)"
+    if not invoice_id:
+        return False, "event carried no invoice id to verify"
+
     status, resp = http_json(
         "GET",
         f"{KILLBILL_URL}/1.0/kb/invoices/{invoice_id}",
@@ -273,14 +314,25 @@ def killbill_verify_invoice_paid(account_id: str, invoice_id: str) -> tuple[bool
     )
     if status != 200 or not isinstance(resp, dict):
         return False, f"invoice lookup http={status} {str(resp)[:140]}"
-    if resp.get("accountId") and resp.get("accountId") != account_id:
+
+    owner = resp.get("accountId")
+    if owner and account_id and owner != account_id:
         return False, "invoice does not belong to the claimed account"
+
+    state = str(resp.get("status") or "").upper()
     balance = resp.get("balance")
-    paid = resp.get("paidAmount")
-    statuses = {str(resp.get("status", "")).upper()}
-    if statuses & {"COMMITTED", "PAID"} and (paid or 0) > 0:
-        return True, f"verified invoice paid={paid} balance={balance} status={resp.get('status')}"
-    return False, f"invoice not paid (status={resp.get('status')} paid={paid} balance={balance})"
+    amount = resp.get("amount")
+
+    if balance is None:
+        return False, f"invoice returned no balance field (status={state or 'missing'}) - refusing"
+    if state != "COMMITTED":
+        return False, f"invoice not committed (status={state or 'missing'})"
+    if float(balance) > 0:
+        return False, (
+            f"invoice not fully paid: balance={balance} amount={amount} "
+            f"(a partial payment does not grant a budget)"
+        )
+    return True, f"verified: status={state} balance={balance} amount={amount}"
 
 
 # --------------------------------------------------------------------------- #
@@ -289,14 +341,18 @@ def killbill_verify_invoice_paid(account_id: str, invoice_id: str) -> tuple[bool
 
 
 def idem_key_of(payload: dict, raw: bytes, source: str = "webhook") -> str:
+    # tenantId is DELIBERATELY excluded. The sweep and the webhook describe the
+    # same underlying payment but cannot know the same tenantId (the sweep runs
+    # on one tenant's credentials). Including it produced two different keys for
+    # one payment, so the sweep would re-apply what the webhook had already done.
+    # objectId is a Kill Bill UUID, globally unique, so it is sufficient alone.
     parts = [
-        str(payload.get("tenantId") or ""),
         str(payload.get("eventType") or ""),
         str(payload.get("objectType") or ""),
         str(payload.get("objectId") or ""),
         str(payload.get("accountId") or ""),
     ]
-    if not any(parts):
+    if all(not p for p in parts):
         return hashlib.sha256(raw).hexdigest()
     return hashlib.sha256("|".join(parts).encode()).hexdigest()
 
@@ -328,6 +384,16 @@ def process_event(conn: sqlite3.Connection, row: sqlite3.Row) -> tuple[str, str]
     """Returns (new_status, message). new_status in {done, skipped, failed}."""
     etype = (row["event_type"] or "").upper()
     account_id = row["account_id"] or ""
+
+    if etype == "SUBSCRIPTION_CHANGE":
+        # Deliberately unhandled for now: deciding the NEW budget needs a
+        # subscription -> plan lookup against Kill Bill, which does not exist yet.
+        # Say so loudly rather than silently doing nothing -- the budget stays at
+        # the old plan's value until the next payment event.
+        return "skipped", (
+            "SUBSCRIPTION_CHANGE not yet handled: budget unchanged until the next "
+            "payment; needs a subscription->plan lookup"
+        )
 
     if etype != ACTION_PAYMENT and etype not in ACTION_CANCEL:
         return "skipped", f"not actionable: {etype or '(no eventType)'}"
@@ -413,6 +479,18 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"ok": False})
             return
 
+        # --- bound concurrency; shed rather than grow threads without limit ---
+        if not _SLOTS.acquire(timeout=RECV_SLOT_WAIT_SECONDS):
+            LOG.warning("at max concurrency (%s) after %.2fs -- shedding with 503",
+                        MAX_CONCURRENT, RECV_SLOT_WAIT_SECONDS)
+            self._send(503, {"ok": False, "error": "busy"})
+            return
+        try:
+            self._handle_event()
+        finally:
+            _SLOTS.release()
+
+    def _handle_event(self) -> None:
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
@@ -432,12 +510,15 @@ class Handler(BaseHTTPRequestHandler):
 
         # --- FAST PATH: persist and ACK. No business logic in the request. ---
         try:
-            conn = db()
+            conn = db(busy_ms=RECV_BUSY_TIMEOUT_MS)
             try:
                 fresh = enqueue(conn, payload, raw)
             finally:
                 conn.close()
         except Exception as exc:  # noqa: BLE001
+            # Non-2xx -> Kill Bill queues a retry. Failing FAST is the entire
+            # point: waiting would park a Kill Bill event-bus thread (see
+            # RECV_BUSY_TIMEOUT_MS).
             LOG.error("persist failed, returning 500 so Kill Bill retries: %s", exc)
             self._send(500, {"ok": False})
             return
@@ -592,60 +673,95 @@ def run_sweep(once: bool = False) -> int:
     conn = db()
     try:
         while True:
-            cursor = conn.execute("SELECT v FROM meta WHERE k='sweep_cursor'").fetchone()
-            offset = int(cursor["v"]) if cursor else 0
-            status, resp = http_json(
-                "GET",
-                f"{KILLBILL_URL}/1.0/kb/payments/pagination?offset={offset}&limit=100&withAttempts=true",
-                None,
-                killbill_headers(),
-            )
-            if status != 200 or not isinstance(resp, list):
-                LOG.error("sweep fetch failed http=%s %s", status, str(resp)[:200])
-                if once:
-                    return 1
-                time.sleep(60)
-                continue
+            row = conn.execute(
+                "SELECT v FROM meta WHERE k='sweep_last_invoice_number'"
+            ).fetchone()
+            try:
+                watermark = float(row["v"]) if row else 0.0
+            except (TypeError, ValueError):
+                watermark = 0.0
 
+            offset = 0
+            pages = 0
+            scanned = 0
             added = 0
-            for pay in resp:
-                if not isinstance(pay, dict):
-                    continue
-                state = str(pay.get("status", "")).upper()
-                if state not in ("SUCCESS", "PENDING"):
-                    continue
-                synthetic = {
-                    "eventType": ACTION_PAYMENT,
-                    "objectType": "INVOICE",
-                    "objectId": pay.get("invoiceId"),
-                    "accountId": pay.get("accountId"),
-                    "tenantId": "sweep",
-                }
-                raw = json.dumps(synthetic, sort_keys=True).encode()
-                if enqueue(conn, synthetic, raw, source="sweep"):
-                    added += 1
+            highest = watermark
+            reached_end = False
 
-            total = conn.execute("SELECT COUNT(*) c FROM events").fetchone()["c"]
-            LOG.info("sweep offset=%s fetched=%s new=%s total_events=%s",
-                     offset, len(resp), added, total)
-
-            if len(resp) < 100:
-                # reached the end -- park the cursor at the current total
-                conn.execute(
-                    "INSERT INTO meta(k,v) VALUES('sweep_cursor',?) "
-                    "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
-                    (str(total),),
+            while pages < SWEEP_MAX_PAGES:
+                # INVOICES, not payments. A Payment object has no `status` and no
+                # `invoiceId` (verified against definitions/Payment), so the
+                # earlier payment-based sweep silently matched nothing, forever.
+                status, resp = http_json(
+                    "GET",
+                    f"{KILLBILL_URL}/1.0/kb/invoices/pagination?offset={offset}&limit=100&audit=true",
+                    None,
+                    killbill_headers(),
                 )
-                if once:
-                    return 0
-                time.sleep(900)
-            else:
+                if status != 200 or not isinstance(resp, list):
+                    LOG.error("sweep fetch failed http=%s %s", status, str(resp)[:200])
+                    break
+
+                for inv in resp:
+                    if not isinstance(inv, dict):
+                        continue
+                    scanned += 1
+                    try:
+                        num = float(inv.get("invoiceNumber"))
+                    except (TypeError, ValueError):
+                        num = 0.0
+                    if num > highest:
+                        highest = num
+                    if num and num <= watermark:
+                        continue  # already covered by an earlier sweep
+
+                    # Invoice fields verified against the live swagger:
+                    #   status  -> DRAFT | COMMITTED | VOID   (there is NO "PAID")
+                    #   balance -> 0.0 once settled
+                    if str(inv.get("status") or "").upper() != "COMMITTED":
+                        continue
+                    balance = inv.get("balance")
+                    if balance is None or float(balance) > 0:
+                        continue
+
+                    synthetic = {
+                        "eventType": ACTION_PAYMENT,
+                        "objectType": "INVOICE",
+                        "objectId": inv.get("invoiceId"),
+                        "accountId": inv.get("accountId"),
+                    }
+                    raw = json.dumps(synthetic, sort_keys=True).encode()
+                    if enqueue(conn, synthetic, raw, source="sweep"):
+                        added += 1
+
+                pages += 1
+                if len(resp) < 100:
+                    reached_end = True
+                    break
                 offset += 100
+
+            if reached_end:
                 conn.execute(
-                    "INSERT INTO meta(k,v) VALUES('sweep_cursor',?) "
+                    "INSERT INTO meta(k,v) VALUES('sweep_last_invoice_number',?) "
                     "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
-                    (str(offset),),
+                    (str(highest),),
                 )
+                LOG.info(
+                    "sweep complete: pages=%s scanned=%s new=%s watermark %.0f -> %.0f",
+                    pages, scanned, added, watermark, highest,
+                )
+            else:
+                # Truncated walk: do NOT advance the watermark. Advancing on a
+                # partial scan would skip every invoice past the page cap
+                # permanently. Re-scanning is cheap -- enqueue() de-duplicates.
+                LOG.warning(
+                    "sweep truncated at %s pages (max %s); watermark left at %.0f",
+                    pages, SWEEP_MAX_PAGES, watermark,
+                )
+
+            if once:
+                return 0
+            time.sleep(SWEEP_INTERVAL_SECONDS)
     finally:
         conn.close()
 

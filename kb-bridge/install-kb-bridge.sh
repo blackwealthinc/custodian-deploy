@@ -62,6 +62,17 @@ KB_WORKER_BATCH=10
 KB_WORKER_POLL_SECONDS=2
 KB_MAX_ATTEMPTS=8
 KB_LOG_LEVEL=INFO
+
+# --- receiver hardening -----------------------------------------------------
+# Kill Bill calls us synchronously on its event-bus thread (shipped default
+# nbThreads=1), so latency here can stall ALL event dispatch. Fail fast instead.
+KB_RECV_BUSY_TIMEOUT_MS=250
+KB_MAX_CONCURRENT=32
+KB_RECV_SLOT_WAIT_SECONDS=0.15
+
+# --- reconciliation sweep ---------------------------------------------------
+KB_SWEEP_MAX_PAGES=20
+KB_SWEEP_INTERVAL_SECONDS=900
 EOF
 sudo chmod 600 "$ENVF"
 sudo chown root:root "$ENVF"
