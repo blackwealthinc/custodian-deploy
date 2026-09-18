@@ -76,7 +76,20 @@ class H(BaseHTTPRequestHandler):
                     limit = int(part.split("=", 1)[1])
                 elif part.startswith("offset="):
                     offset = int(part.split("=", 1)[1])
-            self._send(200, INVOICES[offset:offset + limit])
+            # REAL QUIRK, verified live on .104 (2026-09-18): this endpoint does NOT
+            # load invoice items, and Kill Bill computes BOTH `amount`
+            # (getChargedAmount) and `balance` (getBalance) FROM those items. With
+            # them unloaded, EVERY invoice reports amount=0.0 / balance=0.0 -- even
+            # one genuinely carrying a $12.50 balance. An earlier version of this
+            # mock returned the true values here, which is precisely why the suite
+            # passed while the real sweep was manufacturing false
+            # INVOICE_PAYMENT_SUCCESS events for unpaid invoices. Reproduced now so
+            # the suite fails if the sweep trusts these fields instead of re-reading
+            # the invoice by id.
+            self._send(200, [
+                {**i, "amount": 0.0, "balance": 0.0, "items": []}
+                for i in INVOICES[offset:offset + limit]
+            ])
             return
 
         prefix = "/1.0/kb/invoices/"

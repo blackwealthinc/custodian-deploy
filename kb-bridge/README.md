@@ -121,6 +121,19 @@ GET /1.0/kb/invoices/pagination?offset=N&limit=100&audit=true
 
 A `sweep_last_invoice_number` watermark avoids re-processing. **The watermark is only advanced when the walk completes** — on a truncated walk (page cap reached) it is deliberately left alone, because advancing on a partial scan would skip every invoice past the cap permanently. Re-scanning is cheap since `enqueue()` de-duplicates.
 
+⚠️ **The sweep never trusts a money field from the list response.** Kill Bill's
+`/invoices/pagination` does not load invoice items, and `DefaultInvoice` computes
+**both** `amount` (`getChargedAmount`) and `balance` (`getBalance`) *from* those
+items — so an unpaid invoice with a real $59 balance reports `balance: 0.0` there.
+Verified live 2026-09-18. The old code trusted that field and emitted a false
+`INVOICE_PAYMENT_SUCCESS` for a genuinely unpaid invoice (`scanned=2 new=1`); the
+worker's fail-closed verification refused it, but a sweep must not lie and rely on
+a downstream guard. The sweep now re-reads each candidate via
+`GET /1.0/kb/invoices/{id}` and only enqueues on the *authoritative* status and
+balance. `tests/mock_killbill.py` reproduces the quirk (list returns
+`balance: 0.0` for everything) so the suite fails if anyone reintroduces the
+shortcut — verified: reverting the fix drops the suite to **10/15**.
+
 **About `audit` — corrected 2026-09-18.** An earlier version of this file said
 "Spec ≠ implementation" and told you never to send `audit`. **That was wrong.**
 

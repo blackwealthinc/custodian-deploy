@@ -112,7 +112,7 @@ already handled and deduped it via the shared idempotency key. Only one
 | 405 on setDefault | it is **PUT**, and needs a `{}` body |
 | 400 `productName should not be set when planName is specified` | send `{accountId, planName}` only |
 | 400 `Unrecognized field "amount"` on invoice payment | it is **`purchasedAmount`** |
-| Invoice list shows `amount:0.00, items:[]` but by-id shows `$20` | list endpoints don't populate items; `amount` is derived from them. **`balance` is correct in the list.** |
+| Invoice list shows `amount:0.00, balance:0.00` but by-id shows `$20 / $0` | list endpoints don't load items by default, and `amount` **and `balance`** are both computed FROM items. **Never trust a money field from a list.** Re-read by id. |
 | `{"ok": false}` from the bridge | wrong path — the route is **`/kb/health`**, not `/health` |
 
 ## Note on `KB_BUDGET_DURATION`

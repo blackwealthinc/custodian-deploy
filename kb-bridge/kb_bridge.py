@@ -728,20 +728,42 @@ def run_sweep(once: bool = False) -> int:
                     if num and num <= watermark:
                         continue  # already covered by an earlier sweep
 
-                    # Invoice fields verified against the live swagger:
-                    #   status  -> DRAFT | COMMITTED | VOID   (there is NO "PAID")
-                    #   balance -> 0.0 once settled
-                    if str(inv.get("status") or "").upper() != "COMMITTED":
+                    inv_id = inv.get("invoiceId")
+                    if not inv_id:
                         continue
-                    balance = inv.get("balance")
+
+                    # DO NOT TRUST `balance` OR `amount` FROM THE LIST ENDPOINT.
+                    # Verified live 2026-09-18: /1.0/kb/invoices/pagination does not
+                    # load invoice items, and DefaultInvoice computes BOTH
+                    #     getChargedAmount() -> computeInvoiceAmountCharged(items)
+                    #     getBalance()      -> computeRawInvoiceBalance(items, payments)
+                    # FROM those items. Unloaded => an invoice with a real $59
+                    # balance reports balance=0.0. The old code trusted that, so it
+                    # passed the balance<=0 test and manufactured a false
+                    # INVOICE_PAYMENT_SUCCESS for a genuinely UNPAID invoice
+                    # (observed: "scanned=2 new=1" on an unpaid $59 invoice).
+                    # The list is good for ENUMERATION (id, number, status) only;
+                    # the money fields must be re-read per invoice. The worker's
+                    # fail-closed verification caught it, but a sweep must not
+                    # depend on a downstream guard to avoid lying.
+                    st2, detail = http_json(
+                        "GET", f"{KILLBILL_URL}/1.0/kb/invoices/{inv_id}", None, killbill_headers()
+                    )
+                    if st2 != 200 or not isinstance(detail, dict):
+                        LOG.warning("sweep: could not re-read invoice %s (http=%s) - skipping",
+                                    inv_id, st2)
+                        continue
+                    if str(detail.get("status") or "").upper() != "COMMITTED":
+                        continue
+                    balance = detail.get("balance")
                     if balance is None or float(balance) > 0:
                         continue
 
                     synthetic = {
                         "eventType": ACTION_PAYMENT,
                         "objectType": "INVOICE",
-                        "objectId": inv.get("invoiceId"),
-                        "accountId": inv.get("accountId"),
+                        "objectId": inv_id,
+                        "accountId": detail.get("accountId") or inv.get("accountId"),
                     }
                     raw = json.dumps(synthetic, sort_keys=True).encode()
                     if enqueue(conn, synthetic, raw, source="sweep"):
