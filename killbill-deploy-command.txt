@@ -1,0 +1,31 @@
+CUSTODIAN — KILL BILL DEMO DEPLOY
+=================================
+
+1) SSH INTO THE MACHINE
+   ssh killbill@192.168.50.104
+   password: x
+   (killbill is in the sudo group — sudo password is also "x")
+
+2) RUN THE DEPLOY (one line)
+   sudo apt update && sudo apt install -y curl && curl -s https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/setup-killbill.sh | sudo -E bash
+
+   It will prompt for the sudo password once ("x"), then run ~5-8 minutes on first boot
+   (installs Docker, pulls 3 containers, loads the database, starts the Java engine).
+   That's normal — it is not stuck.
+
+3) WHEN DONE
+   Open a browser to:  http://192.168.50.104:9090
+   Login:  admin / password
+   Kaui will prompt you to create your first tenant on first login.
+
+   Engine API:  http://192.168.50.104:8080
+
+4) USEFUL COMMANDS (after deploy)
+   docker ps
+   docker logs killbill -f
+   docker compose -f /opt/killbill/docker-compose.yml ps
+   (the database password is saved at /opt/killbill/.db-credentials)
+
+NOTES
+- Re-running the command is safe (idempotent) — it reuses the existing database.
+- This is DEMO ONLY. It moves to a Contabo VPS later.

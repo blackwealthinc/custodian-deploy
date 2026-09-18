@@ -1,0 +1,26 @@
+KILL BILL — BUG #148 FIX (OPTIONAL RE-RUN)
+=========================================
+
+VERDICT: You do NOT need to run anything. The .104 machine is already
+deployed and healthy. This bug was only a false alarm in the script's
+health check — the actual deployment succeeded.
+
+Current live state (verified over SSH, .104):
+  - Engine  http://192.168.50.104:8080/1.0/healthcheck  -> HTTP 200, "OK"
+  - Kaui    http://192.168.50.104:9090                  -> HTTP 302 (login)
+  - Uptime: 1 day 19h
+
+WHAT WAS FIXED:
+  Step 6 of setup-killbill.sh was grepping the logs for "Server startup"
+  (a Tomcat line that never appears in Kill Bill's JSON logs). Reverted to
+  the correct readiness probe: curl -sf /1.0/healthcheck (200 = ready,
+  500 = still starting). Committed + pushed as ac8fbef.
+
+OPTIONAL — only if you want to re-run and watch it pass end-to-end
+(it is idempotent and safe; reuses the existing database):
+
+    curl -s https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/setup-killbill.sh | sudo -E bash
+
+Expected: it will fly through the steps and end with "OK: Kill Bill
+engine ready — /1.0/healthcheck returned 200 OK" instead of the old
+false "did not become ready" error.
