@@ -46,12 +46,14 @@ import json
 import logging
 import os
 import signal
+import socket
 import sqlite3
 import sys
 import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 LOG = logging.getLogger("kb-bridge")
@@ -88,16 +90,35 @@ _load_env_file(os.environ.get("KB_ENV_FILE", "/opt/kb-bridge/kb-bridge.env"))
 
 
 def cfg(name: str, default: str | None = None, required: bool = False) -> str:
-    val = os.environ.get(name, default)
-    if required and not val:
+    """Read a config value, treating an EMPTY value as unset.
+
+    Bug #155: `os.environ.get(name, default)` returns "" when the variable EXISTS
+    but is blank -- the default is only used when the variable is absent. Every
+    numeric config is then parsed with int()/float(), so one stray
+    `KB_LEASE_SECONDS=` in the env file raised ValueError at import time and the
+    bridge refused to start at all. The env file is hand-edited by whoever
+    installs the box, so a blank value must fall back to the default rather than
+    take the service down.
+    """
+    val = os.environ.get(name)
+    if val is None or not val.strip():
+        val = default
+    if required and not (val or "").strip():
         LOG.error("FATAL: %s is required but not set", name)
         sys.exit(2)
-    return val or ""
+    return (val or "").strip()
 
 
 def cfg_bool(name: str, default: bool) -> bool:
+    """Read a boolean, treating an EMPTY value as unset.
+
+    Bug #155 (the dangerous half): an empty value used to fall through to
+    `"" in ("1","true","yes","on")` == False. So a blank `KB_VERIFY=` turned
+    verification OFF -- silently inverting a fail-CLOSED security control into a
+    fail-OPEN one. A blank value must mean "unset", never "false".
+    """
     raw = os.environ.get(name)
-    if raw is None:
+    if raw is None or not raw.strip():
         return default
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
@@ -120,8 +141,32 @@ BATCH = int(cfg("KB_WORKER_BATCH", "10"))
 POLL_SECONDS = float(cfg("KB_WORKER_POLL_SECONDS", "2"))
 MAX_ATTEMPTS = int(cfg("KB_MAX_ATTEMPTS", "8"))
 HTTP_TIMEOUT = float(cfg("KB_HTTP_TIMEOUT", "20"))
-SWEEP_MAX_PAGES = int(cfg("KB_SWEEP_MAX_PAGES", "20"))
 SWEEP_INTERVAL_SECONDS = float(cfg("KB_SWEEP_INTERVAL_SECONDS", "900"))
+
+# --- worker lease (Bug #150) ----------------------------------------------- #
+# Claiming a row is "borrowing it for a fixed period", never permanent ownership.
+# If the worker dies between the claim and the status update (SIGKILL, OOM kill
+# under MemoryMax, power loss) the lease expires and the row is reclaimed. That
+# is the ONLY thing that makes a claimed-but-abandoned payment recoverable;
+# without it `status='processing'` is a terminal state nothing ever leaves.
+# LEASE_SECONDS must comfortably exceed the worst case for ONE row (bounded by
+# HTTP_TIMEOUT); the worker also renews it while working through a batch.
+LEASE_SECONDS = float(cfg("KB_LEASE_SECONDS", "600"))
+REAP_BATCH = int(cfg("KB_REAP_BATCH", "100"))
+WORKER_OWNER = f"{socket.gethostname()}:{os.getpid()}"
+
+# --- sweep scope (Bug #151) ------------------------------------------------ #
+# The sweep walks FORWARD BY INVOICE NUMBER, so this bounds one run's work
+# rather than bounding how far into history we are ever able to see. Each step
+# is one byNumber call. 200 absorbs a long outage; the next run continues from
+# the advanced watermark.
+SWEEP_MAX_INVOICES = int(cfg("KB_SWEEP_MAX_INVOICES", "200"))
+# Invoice numbers are per-tenant and normally contiguous, but a number CAN be
+# consumed without an invoice surviving (aborted generation). Treating the first
+# missing number as the end of history would stall the walk at that gap forever --
+# the same permanent-blindness failure the byNumber walk exists to remove. So the
+# end of the sequence is only declared after this many consecutive misses.
+SWEEP_MAX_GAPS = int(cfg("KB_SWEEP_MAX_GAPS", "50"))
 
 # --- receiver hardening ---------------------------------------------------- #
 # The receiver must NEVER park a Kill Bill event-bus thread. Kill Bill's shipped
@@ -163,9 +208,16 @@ CREATE TABLE IF NOT EXISTS events (
     attempts        INTEGER NOT NULL DEFAULT 0,
     last_error      TEXT,
     next_attempt_at REAL    NOT NULL DEFAULT 0,
-    processed_at    REAL
+    processed_at    REAL,
+    -- lease fields (Bug #150): a claim is a time-boxed borrow, not ownership.
+    -- lease_expires_at is epoch seconds (REAL) -- never a formatted string.
+    lease_token     TEXT,
+    lease_expires_at REAL,
+    owner           TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_events_ready ON events(status, next_attempt_at);
+-- the reclaim query path: status + expiry (Bug #150)
+CREATE INDEX IF NOT EXISTS idx_events_lease ON events(status, lease_expires_at);
 
 CREATE TABLE IF NOT EXISTS accounts (
     account_id TEXT PRIMARY KEY,
@@ -188,6 +240,40 @@ CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 """
 
 
+_SCHEMA_READY = False
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Bring an existing database up to the current schema. Idempotent.
+
+    CREATE TABLE IF NOT EXISTS is a no-op on an existing table, so purely
+    additive changes never reach a deployed database. That is exactly how a
+    schema change silently ships broken: the fresh install works and the running
+    box does not. Additive migrations are applied here, once per process.
+    """
+    global _SCHEMA_READY
+    if _SCHEMA_READY:
+        return
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
+    ).fetchone()
+    if not exists:
+        return  # init_db() will create it with the full schema
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(events)")}
+    for col, decl in (
+        ("lease_token", "TEXT"),
+        ("lease_expires_at", "REAL"),
+        ("owner", "TEXT"),
+    ):
+        if col not in have:
+            LOG.info("migrating: adding events.%s", col)
+            conn.execute(f"ALTER TABLE events ADD COLUMN {col} {decl}")  # noqa: S608 - fixed literals
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_lease ON events(status, lease_expires_at)"
+    )
+    _SCHEMA_READY = True
+
+
 def db(busy_ms: int = 5000) -> sqlite3.Connection:
     """Open the queue database.
 
@@ -203,6 +289,7 @@ def db(busy_ms: int = 5000) -> sqlite3.Connection:
     # synchronous is per-connection (default FULL = fsync per commit) so it stays.
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute(f"PRAGMA busy_timeout={int(busy_ms)}")
+    _migrate(conn)
     return conn
 
 
@@ -335,9 +422,79 @@ def killbill_verify_invoice_paid(account_id: str, invoice_id: str) -> tuple[bool
     return True, f"verified: status={state} balance={balance} amount={amount}"
 
 
+def killbill_verify_subscription_ended(account_id: str, subscription_id: str) -> tuple[bool, str]:
+    """Re-verify a claimed cancellation against Kill Bill. Fail closed.
+
+    Bug #153: the cancellation path used to "verify" nothing but the presence of
+    credentials, so ANY request carrying the callback path token could zero a
+    paying customer's budget (on_cancel_budget=0.0 for every seeded plan). The
+    path token is documented in this file as a noise filter, not authentication,
+    so it must not be the only control on a destructive action.
+
+    The official Kill Bill push-notification docs state the contract plainly:
+    "it is expected that your handler calls back the Kill Bill APIs to retrieve
+    the latest state of the objects before acting upon it."
+
+    `state` values come from the engine's Subscription definition; the ones that
+    mean "this entitlement is over" are CANCELLED and EXPIRED.
+    """
+    if not killbill_configured():
+        return False, "killbill credentials not configured (fail-closed)"
+    if not subscription_id:
+        return False, "event carried no subscription id to verify"
+
+    status, resp = http_json(
+        "GET",
+        f"{KILLBILL_URL}/1.0/kb/subscriptions/{subscription_id}",
+        None,
+        killbill_headers(),
+    )
+    if status == 200 and isinstance(resp, dict):
+        owner = resp.get("accountId")
+        if owner and account_id and owner != account_id:
+            return False, "subscription does not belong to the claimed account"
+        state = str(resp.get("state") or "").upper()
+        if state in ("CANCELLED", "EXPIRED"):
+            return True, f"verified: subscription state={state}"
+        return False, f"subscription has not ended (state={state or 'missing'}) - refusing"
+
+    if status == 404:
+        # The subscription is gone entirely; there is no entitlement left to keep
+        # a budget for.
+        return True, "verified: subscription no longer exists (404)"
+
+    return False, f"subscription lookup http={status} {str(resp)[:140]}"
+
+
 # --------------------------------------------------------------------------- #
 # Event -> action
 # --------------------------------------------------------------------------- #
+
+
+def payment_id_of(payload: dict) -> str:
+    """Return the payment identity Kill Bill publishes in `metaData`.
+
+    `metaData` is itself a JSON *string* nested inside the JSON payload and holds
+    the event-specific metadata. For payment events it carries `paymentId`, and
+    that is the only field that identifies THE PAYMENT.
+
+    objectId must never be used as the payment identity: for INVOICE_PAYMENT_*
+    Kill Bill sets objectType=INVOICE and objectId=<invoiceId> (verified live),
+    so every payment against one invoice would collapse to one identity.
+    """
+    meta = payload.get("metaData")
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except (json.JSONDecodeError, ValueError):
+            return ""
+    if not isinstance(meta, dict):
+        return ""
+    for key in ("paymentId", "paymentAttemptId"):
+        val = meta.get(key)
+        if val:
+            return str(val)
+    return ""
 
 
 def idem_key_of(payload: dict, raw: bytes, source: str = "webhook") -> str:
@@ -345,12 +502,28 @@ def idem_key_of(payload: dict, raw: bytes, source: str = "webhook") -> str:
     # same underlying payment but cannot know the same tenantId (the sweep runs
     # on one tenant's credentials). Including it produced two different keys for
     # one payment, so the sweep would re-apply what the webhook had already done.
-    # objectId is a Kill Bill UUID, globally unique, so it is sufficient alone.
+    #
+    # CORRECTED (Bug #149, 2026-09-18): objectId is NOT sufficient alone, which
+    # is what this comment used to claim. For INVOICE_PAYMENT_SUCCESS/FAILED
+    # Kill Bill sets objectType=INVOICE and objectId=<invoiceId> (verified live),
+    # so every payment against the same invoice produced an IDENTICAL key. The
+    # 2nd and later ones hit the UNIQUE constraint, were ACKed as `duplicate`
+    # and silently discarded -- the customer paid again and got no budget.
+    #
+    # The identity of a payment event is the PAYMENT, which Kill Bill publishes
+    # in metaData.paymentId (even the official docs point at metaData for the
+    # event-specific payload). The sweep recovers the same id from
+    # GET /1.0/kb/invoices/{id}/payments, so webhook/sweep dedup still works.
+    #
+    # This changes the key for events stored before the fix. Re-processing one of
+    # those is harmless: the action is "set this budget to this fixed value",
+    # which is idempotent by construction.
     parts = [
         str(payload.get("eventType") or ""),
         str(payload.get("objectType") or ""),
         str(payload.get("objectId") or ""),
         str(payload.get("accountId") or ""),
+        payment_id_of(payload),
     ]
     if all(not p for p in parts):
         return hashlib.sha256(raw).hexdigest()
@@ -415,7 +588,18 @@ def process_event(conn: sqlite3.Connection, row: sqlite3.Row) -> tuple[str, str]
         if etype == ACTION_PAYMENT:
             ok, why = killbill_verify_invoice_paid(account_id, row["object_id"] or "")
         else:
-            ok, why = (killbill_configured(), "cancellation requires killbill credentials (fail-closed)")
+            # Bug #153: a cancellation is a DESTRUCTIVE act -- it drives the budget
+            # to on_cancel_budget, which is 0.0 for every seeded plan. It therefore
+            # gets the same corroboration the payment path gets. "Are credentials
+            # configured?" is not a verification of anything; it let any request
+            # bearing the callback path token zero a paying customer's budget.
+            if (row["object_type"] or "").upper() != "SUBSCRIPTION":
+                ok, why = False, (
+                    f"cancellation with objectType={row['object_type']!r} cannot be "
+                    f"verified against the engine (expected SUBSCRIPTION) - refusing"
+                )
+            else:
+                ok, why = killbill_verify_subscription_ended(account_id, row["object_id"] or "")
         if not ok:
             return "failed", f"verification refused: {why}"
 
@@ -444,6 +628,63 @@ def backoff_seconds(attempts: int) -> float:
 # --------------------------------------------------------------------------- #
 
 _READY = True
+
+
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """A ThreadingHTTPServer that refuses a connection BEFORE spawning a thread.
+
+    Bug #152: ThreadingMixIn creates one thread per connection in
+    process_request(), so a BoundedSemaphore acquired *inside* the request handler
+    bounds concurrent handlers -- not threads, and not accepted connections. A
+    connection flood therefore grew threads without limit until the unit hit
+    MemoryMax and was killed, which is the worst outcome available here: Kill Bill
+    then burns its bounded retries against a dead callback and the payment grant
+    is lost. The slot has to be taken here, before the thread exists, or the bound
+    does not hold.
+
+    request_queue_size is also raised: the stdlib default is 5, so legitimate
+    bursts were being refused at the TCP backlog before our own logic ever ran.
+    """
+
+    daemon_threads = True
+    request_queue_size = 128
+
+    def process_request(self, request, client_address):
+        if not _SLOTS.acquire(timeout=RECV_SLOT_WAIT_SECONDS):
+            LOG.warning("at max concurrency (%s) after %.2fs -- shedding connection",
+                        MAX_CONCURRENT, RECV_SLOT_WAIT_SECONDS)
+            self._shed(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            _SLOTS.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            _SLOTS.release()
+
+    @staticmethod
+    def _shed(request) -> None:
+        """Answer 503 straight on the socket: no thread, no handler."""
+        try:
+            body = b'{"ok": false, "error": "busy"}'
+            request.sendall(
+                b"HTTP/1.1 503 Service Unavailable\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Connection: close\r\n"
+                b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+            )
+        except Exception:  # noqa: BLE001 - the peer may already be gone
+            pass
+        finally:
+            try:
+                request.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -479,16 +720,12 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"ok": False})
             return
 
-        # --- bound concurrency; shed rather than grow threads without limit ---
-        if not _SLOTS.acquire(timeout=RECV_SLOT_WAIT_SECONDS):
-            LOG.warning("at max concurrency (%s) after %.2fs -- shedding with 503",
-                        MAX_CONCURRENT, RECV_SLOT_WAIT_SECONDS)
-            self._send(503, {"ok": False, "error": "busy"})
-            return
-        try:
-            self._handle_event()
-        finally:
-            _SLOTS.release()
+        # --- bounded concurrency ---
+        # The slot is ALREADY held: it is taken in
+        # BoundedThreadingHTTPServer.process_request, before this thread was
+        # spawned. Acquiring it here would be far too late to bound thread count
+        # (Bug #152).
+        self._handle_event()
 
     def _handle_event(self) -> None:
         try:
@@ -545,9 +782,12 @@ def run_receiver() -> int:
     if not PATH_TOKEN:
         LOG.warning("KB_PATH_TOKEN is empty -- receiver will reject everything (fail-closed)")
 
-    httpd = ThreadingHTTPServer((BIND, PORT), Handler)
-    httpd.daemon_threads = True
-    LOG.info("receiver listening on %s:%s  path=/kb/events/<token>  db=%s", BIND, PORT, DB_PATH)
+    httpd = BoundedThreadingHTTPServer((BIND, PORT), Handler)
+    LOG.info(
+        "receiver listening on %s:%s  path=/kb/events/<token>  db=%s  "
+        "max_concurrent=%s  backlog=%s",
+        BIND, PORT, DB_PATH, MAX_CONCURRENT, httpd.request_queue_size,
+    )
     try:
         httpd.serve_forever(poll_interval=0.5)
     finally:
@@ -562,8 +802,16 @@ def run_receiver() -> int:
 _WORK = True
 
 
-def claim_batch(conn: sqlite3.Connection, limit: int) -> list[sqlite3.Row]:
+def claim_batch(conn: sqlite3.Connection, limit: int) -> tuple[str, list[sqlite3.Row]]:
+    """Claim up to `limit` rows under a fresh lease. Returns (lease_token, rows).
+
+    The token is the credential for this claim. Every later write made on behalf
+    of these rows must present it, so a worker that was declared dead, then came
+    back, cannot clobber a row another worker has legitimately reclaimed in the
+    meantime (the "one job, two writers" failure).
+    """
     now = time.time()
+    token = uuid.uuid4().hex
     conn.execute("BEGIN IMMEDIATE")
     try:
         rows = conn.execute(
@@ -573,14 +821,79 @@ def claim_batch(conn: sqlite3.Connection, limit: int) -> list[sqlite3.Row]:
         ).fetchall()
         if rows:
             conn.executemany(
-                "UPDATE events SET status='processing', attempts=attempts+1 WHERE id=?",
-                [(r["id"],) for r in rows],
+                "UPDATE events SET status='processing', attempts=attempts+1, "
+                "lease_token=?, lease_expires_at=?, owner=? WHERE id=?",
+                [(token, now + LEASE_SECONDS, WORKER_OWNER, r["id"]) for r in rows],
             )
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
         raise
-    return rows
+    return token, rows
+
+
+def renew_lease(conn: sqlite3.Connection, token: str) -> None:
+    """Heartbeat: "I am alive and I still hold these rows."
+
+    Called as the worker finishes each row of a batch, so a batch that runs longer
+    than LEASE_SECONDS does not have its tail reclaimed out from under a worker
+    that is working perfectly well.
+    """
+    conn.execute(
+        "UPDATE events SET lease_expires_at=? WHERE lease_token=? AND status='processing'",
+        (time.time() + LEASE_SECONDS, token),
+    )
+
+
+def reclaim_expired(conn: sqlite3.Connection) -> int:
+    """Return abandoned rows to the queue. The half of Bug #150 that was missing.
+
+    A row stuck in 'processing' is worse than a failed one: it is INVISIBLE. It
+    is not 'pending' (so no worker ever picks it up), not 'failed' (so nothing
+    alarms), and the queue looks healthy. Only lease expiry reveals it.
+    """
+    now = time.time()
+    rows = conn.execute(
+        "SELECT id, attempts FROM events WHERE status='processing' "
+        "AND lease_expires_at IS NOT NULL AND lease_expires_at < ? "
+        "ORDER BY id LIMIT ?",
+        (now, REAP_BATCH),
+    ).fetchall()
+    if not rows:
+        return 0
+    for r in rows:
+        if r["attempts"] >= MAX_ATTEMPTS:
+            # A row that keeps killing its worker must reach a terminal state
+            # rather than crash-looping forever.
+            conn.execute(
+                "UPDATE events SET status='failed', last_error=?, processed_at=?, "
+                "lease_token=NULL, lease_expires_at=NULL WHERE id=?",
+                (f"lease expired after {r['attempts']} attempts "
+                 f"(worker died or hung every time)", now, r["id"]),
+            )
+        else:
+            conn.execute(
+                "UPDATE events SET status='pending', next_attempt_at=?, last_error=?, "
+                "lease_token=NULL, lease_expires_at=NULL WHERE id=?",
+                (now, "lease expired - reclaimed (worker died or hung)", r["id"]),
+            )
+    LOG.warning("reclaimed %s abandoned event(s) whose lease had expired", len(rows))
+    return len(rows)
+
+
+def release_own_leases(conn: sqlite3.Connection) -> int:
+    """On graceful shutdown, hand back anything this process still holds.
+
+    Without this a clean restart has to wait out the whole lease before those
+    rows are picked up again.
+    """
+    cur = conn.execute(
+        "UPDATE events SET status='pending', next_attempt_at=0, "
+        "lease_token=NULL, lease_expires_at=NULL "
+        "WHERE status='processing' AND owner=?",
+        (WORKER_OWNER,),
+    )
+    return cur.rowcount or 0
 
 
 def run_worker() -> int:
@@ -600,15 +913,22 @@ def run_worker() -> int:
         return 2
 
     LOG.info(
-        "worker started  db=%s  litellm=%s  verify=%s  plan_default_duration=%s",
-        DB_PATH, LITELLM_URL, VERIFY, BUDGET_DURATION or "(none)",
+        "worker started  db=%s  litellm=%s  verify=%s  lease=%ss  owner=%s  "
+        "plan_default_duration=%s",
+        DB_PATH, LITELLM_URL, VERIFY, LEASE_SECONDS, WORKER_OWNER,
+        BUDGET_DURATION or "(none)",
     )
 
     conn = db()
     idle_logged = False
     try:
         while _WORK:
-            rows = claim_batch(conn, BATCH)
+            # Bug #150: before looking for work, take back any row whose owner
+            # died. This is the only thing standing between a mid-batch SIGKILL
+            # and a permanently stranded payment.
+            reclaim_expired(conn)
+
+            token, rows = claim_batch(conn, BATCH)
             if not rows:
                 if not idle_logged:
                     LOG.debug("queue empty")
@@ -617,38 +937,63 @@ def run_worker() -> int:
                 continue
             idle_logged = False
 
-            for row in rows:
+            for idx, row in enumerate(rows):
                 try:
                     status, msg = process_event(conn, row)
                 except Exception as exc:  # noqa: BLE001
                     status, msg = "failed", f"{type(exc).__name__}: {exc}"
 
+                now = time.time()
+                # Every terminal write carries `AND lease_token=?`. If our lease
+                # was reclaimed while we worked, rowcount is 0: another worker now
+                # owns this row and has already decided its outcome. Do not fight
+                # it -- that is the "one job, two writers" corruption the token
+                # exists to prevent.
                 if status == "failed":
                     attempts = row["attempts"] + 1
                     if attempts >= MAX_ATTEMPTS:
                         LOG.error("event id=%s gave up after %s attempts: %s",
                                   row["id"], attempts, msg)
-                        conn.execute(
-                            "UPDATE events SET status='failed', last_error=?, processed_at=?"
-                            " WHERE id=?",
-                            (msg[:500], time.time(), row["id"]),
-                        )
+                        n = conn.execute(
+                            "UPDATE events SET status='failed', last_error=?, processed_at=?, "
+                            "lease_token=NULL, lease_expires_at=NULL "
+                            "WHERE id=? AND lease_token=?",
+                            (msg[:500], now, row["id"], token),
+                        ).rowcount
                     else:
                         delay = backoff_seconds(attempts)
                         LOG.warning("event id=%s attempt %s failed (%s); retry in %.0fs",
                                     row["id"], attempts, msg[:160], delay)
-                        conn.execute(
-                            "UPDATE events SET status='pending', last_error=?, next_attempt_at=?"
-                            " WHERE id=?",
-                            (msg[:500], time.time() + delay, row["id"]),
-                        )
+                        n = conn.execute(
+                            "UPDATE events SET status='pending', last_error=?, next_attempt_at=?, "
+                            "lease_token=NULL, lease_expires_at=NULL "
+                            "WHERE id=? AND lease_token=?",
+                            (msg[:500], now + delay, row["id"], token),
+                        ).rowcount
                 else:
                     LOG.info("event id=%s %s: %s", row["id"], status, msg[:200])
-                    conn.execute(
-                        "UPDATE events SET status=?, last_error=?, processed_at=? WHERE id=?",
-                        (status, msg[:500], time.time(), row["id"]),
-                    )
+                    n = conn.execute(
+                        "UPDATE events SET status=?, last_error=?, processed_at=?, "
+                        "lease_token=NULL, lease_expires_at=NULL "
+                        "WHERE id=? AND lease_token=?",
+                        (status, msg[:500], now, row["id"], token),
+                    ).rowcount
+
+                if not n:
+                    LOG.warning("event id=%s result discarded: our lease had been "
+                                "reclaimed, another worker owns it now", row["id"])
+
+                if idx < len(rows) - 1:
+                    renew_lease(conn, token)  # heartbeat for the rest of the batch
     finally:
+        # Hand back anything still held, so a clean restart does not have to wait
+        # out the full lease before those rows are picked up again.
+        try:
+            released = release_own_leases(conn)
+            if released:
+                LOG.info("released %s unprocessed event(s) back to the queue", released)
+        except Exception:  # noqa: BLE001 - shutdown path, never raise
+            pass
         conn.close()
     return 0
 
@@ -656,6 +1001,91 @@ def run_worker() -> int:
 # --------------------------------------------------------------------------- #
 # sweep (reconciliation -- covers events that exhausted Kill Bill's retries)
 # --------------------------------------------------------------------------- #
+
+
+def _sweep_payment_id(invoice_id: str) -> tuple[str, str]:
+    """Return (paymentId, note) for the payment that completed an invoice.
+
+    The sweep has to produce the SAME idempotency identity the webhook would
+    have, or the two sources stop de-duplicating against each other. Kill Bill's
+    Invoice definition carries no `payments` array (verified live), so the id
+    comes from the dedicated payments endpoint.
+    """
+    st, pays = http_json(
+        "GET", f"{KILLBILL_URL}/1.0/kb/invoices/{invoice_id}/payments",
+        None, killbill_headers(),
+    )
+    if st != 200 or not isinstance(pays, list):
+        return "", f"payments lookup http={st} {str(pays)[:120]}"
+
+    best, best_num = "", -1
+    for p in pays:
+        if not isinstance(p, dict):
+            continue
+        # Only a genuinely successful PURCHASE moved money. A credit or a voided
+        # attempt must not be mistaken for the payment.
+        if not any(
+            str(t.get("transactionType") or "").upper() == "PURCHASE"
+            and str(t.get("status") or "").upper() == "SUCCESS"
+            for t in (p.get("transactions") or [])
+        ):
+            continue
+        try:
+            num = int(str(p.get("paymentNumber") or "0"))
+        except (TypeError, ValueError):
+            num = 0
+        if num >= best_num:
+            best_num, best = num, str(p.get("paymentId") or "")
+    return best, "ok"
+
+
+def _sweep_consider_invoice(conn: sqlite3.Connection, inv: dict) -> tuple[bool, str]:
+    """Decide whether one invoice needs a payment event, and enqueue it.
+
+    `inv` must be a FULL invoice (from byNumber or by-id), never a list item --
+    the list endpoint does not load invoice items, so DefaultInvoice computes both
+    chargedAmount and balance from those items and reports 0.0 for an invoice that
+    genuinely has a balance. Trusting that manufactured a false
+    INVOICE_PAYMENT_SUCCESS for an unpaid $59 invoice (observed 2026-09-18).
+    """
+    inv_id = inv.get("invoiceId")
+    if not inv_id:
+        return False, "no invoiceId"
+
+    status = str(inv.get("status") or "").upper()
+    if status != "COMMITTED":
+        return False, f"status={status or 'missing'}"
+
+    balance = inv.get("balance")
+    if balance is None:
+        return False, "invoice returned no balance field"
+    if float(balance) > 0:
+        return False, f"not fully paid (balance={balance})"
+
+    account_id = inv.get("accountId")
+    if not account_id:
+        return False, "no accountId"
+
+    pid, note = _sweep_payment_id(inv_id)
+    if not pid:
+        # Fully paid with no successful payment on record means something other
+        # than money settled it (a credit / CBA). No payment, no budget: fail
+        # closed rather than grant service nobody paid for.
+        return False, f"fully paid but no successful payment on record ({note}) - not granting"
+
+    synthetic = {
+        "eventType": ACTION_PAYMENT,
+        "objectType": "INVOICE",
+        "objectId": inv_id,
+        "accountId": account_id,
+        # metaData is a JSON *string* in real payloads; mirror that so the
+        # idempotency key comes out identical to the webhook's.
+        "metaData": json.dumps({"paymentId": pid}),
+    }
+    raw = json.dumps(synthetic, sort_keys=True).encode()
+    if enqueue(conn, synthetic, raw, source="sweep"):
+        return True, f"enqueued invoice={inv_id} payment={pid}"
+    return False, "already queued (duplicate)"
 
 
 def run_sweep(once: bool = False) -> int:
@@ -677,121 +1107,101 @@ def run_sweep(once: bool = False) -> int:
                 "SELECT v FROM meta WHERE k='sweep_last_invoice_number'"
             ).fetchone()
             try:
-                watermark = float(row["v"]) if row else 0.0
+                # Stored as a string; accept the legacy float form too.
+                watermark = int(float(row["v"])) if row else 0
             except (TypeError, ValueError):
-                watermark = 0.0
+                watermark = 0
 
-            offset = 0
-            pages = 0
             scanned = 0
             added = 0
             highest = watermark
             reached_end = False
+            stopped_at = 0
 
-            while pages < SWEEP_MAX_PAGES:
-                # INVOICES, not payments. A Payment object has no `status` and no
-                # `invoiceId` (verified against definitions/Payment), so the
-                # earlier payment-based sweep silently matched nothing, forever.
-                #
-                # NO `audit` PARAM -- deliberately omitted.
-                #
-                # CORRECTED (2026-09-18): an earlier comment here claimed
-                # "spec != implementation". That was WRONG. `audit` is not a
-                # string, it is an enum:
-                #     @QueryParam(QUERY_AUDIT) @DefaultValue("NONE") AuditMode
-                # and AuditMode does AuditLevel.valueOf(str.toUpperCase()).
-                # An invalid value throws during JAX-RS parameter conversion and
-                # the spec REQUIRES a 404 for that. So the 404 was correct
-                # behaviour, not a Kill Bill bug, and the param is usable as
-                # audit=NONE|FULL|MINIMAL (all confirmed 200 live on .104).
-                # We omit it because NONE is already the default.
-                status, resp = http_json(
-                    "GET",
-                    f"{KILLBILL_URL}/1.0/kb/invoices/pagination?offset={offset}&limit=100",
-                    None,
-                    killbill_headers(),
+            # Bug #151: walk FORWARD BY NUMBER from the watermark.
+            #
+            # The old code paged /1.0/kb/invoices/pagination from offset=0 with a
+            # cap of SWEEP_MAX_PAGES*100 = 2000 invoices. That endpoint returns
+            # invoices ASCENDING by invoiceNumber (verified live: offset 0 gave
+            # num=1 then num=2), so once a tenant passed 2000 invoices every run
+            # rescanned the same oldest 2000, `reached_end` stayed False, the
+            # watermark never advanced, and the NEW invoices were never examined
+            # again. Reconciliation died silently at exactly the volume where it
+            # starts to matter.
+            #
+            # byNumber also returns the FULL invoice including items, so `balance`
+            # and `amount` are authoritative here -- one call per invoice covers
+            # both the enumeration and the money fields the list endpoint cannot
+            # be trusted for.
+            #
+            # Because the walk is strictly contiguous and ascending, every invoice
+            # below `highest` has been fully considered, so advancing the watermark
+            # to it is safe even when a run stops early (per-run cap or a transient
+            # error). That is what makes this self-healing instead of self-blinding.
+            n = watermark + 1
+            probes = 0
+            misses = 0
+            while probes < SWEEP_MAX_INVOICES:
+                probes += 1
+                st, inv = http_json(
+                    "GET", f"{KILLBILL_URL}/1.0/kb/invoices/byNumber/{n}",
+                    None, killbill_headers(),
                 )
-                if status != 200 or not isinstance(resp, list):
-                    LOG.error("sweep fetch failed http=%s %s", status, str(resp)[:200])
-                    break
-
-                for inv in resp:
-                    if not isinstance(inv, dict):
-                        continue
+                if st == 200 and isinstance(inv, dict):
+                    misses = 0
                     scanned += 1
-                    try:
-                        num = float(inv.get("invoiceNumber"))
-                    except (TypeError, ValueError):
-                        num = 0.0
-                    if num > highest:
-                        highest = num
-                    if num and num <= watermark:
-                        continue  # already covered by an earlier sweep
-
-                    inv_id = inv.get("invoiceId")
-                    if not inv_id:
-                        continue
-
-                    # DO NOT TRUST `balance` OR `amount` FROM THE LIST ENDPOINT.
-                    # Verified live 2026-09-18: /1.0/kb/invoices/pagination does not
-                    # load invoice items, and DefaultInvoice computes BOTH
-                    #     getChargedAmount() -> computeInvoiceAmountCharged(items)
-                    #     getBalance()      -> computeRawInvoiceBalance(items, payments)
-                    # FROM those items. Unloaded => an invoice with a real $59
-                    # balance reports balance=0.0. The old code trusted that, so it
-                    # passed the balance<=0 test and manufactured a false
-                    # INVOICE_PAYMENT_SUCCESS for a genuinely UNPAID invoice
-                    # (observed: "scanned=2 new=1" on an unpaid $59 invoice).
-                    # The list is good for ENUMERATION (id, number, status) only;
-                    # the money fields must be re-read per invoice. The worker's
-                    # fail-closed verification caught it, but a sweep must not
-                    # depend on a downstream guard to avoid lying.
-                    st2, detail = http_json(
-                        "GET", f"{KILLBILL_URL}/1.0/kb/invoices/{inv_id}", None, killbill_headers()
-                    )
-                    if st2 != 200 or not isinstance(detail, dict):
-                        LOG.warning("sweep: could not re-read invoice %s (http=%s) - skipping",
-                                    inv_id, st2)
-                        continue
-                    if str(detail.get("status") or "").upper() != "COMMITTED":
-                        continue
-                    balance = detail.get("balance")
-                    if balance is None or float(balance) > 0:
-                        continue
-
-                    synthetic = {
-                        "eventType": ACTION_PAYMENT,
-                        "objectType": "INVOICE",
-                        "objectId": inv_id,
-                        "accountId": detail.get("accountId") or inv.get("accountId"),
-                    }
-                    raw = json.dumps(synthetic, sort_keys=True).encode()
-                    if enqueue(conn, synthetic, raw, source="sweep"):
+                    highest = n
+                    ok, why = _sweep_consider_invoice(conn, inv)
+                    if ok:
                         added += 1
+                        LOG.warning("sweep: %s", why)
+                    n += 1
+                    continue
 
-                pages += 1
-                if len(resp) < 100:
-                    reached_end = True
-                    break
-                offset += 100
+                # A number with no invoice. Verified live: HTTP 400 / code 4018
+                # "No invoice could be found for number N." Counted, not fatal --
+                # see SWEEP_MAX_GAPS for why a single gap must not end the walk.
+                if st == 400 and isinstance(inv, dict) and inv.get("code") == 4018:
+                    misses += 1
+                    if misses >= SWEEP_MAX_GAPS:
+                        reached_end = True
+                        break
+                    n += 1
+                    continue
 
-            if reached_end:
+                # Anything else is transient (network, 5xx, auth blip). Stop here.
+                # `highest` still covers everything already handled, so the next
+                # run resumes AT this invoice rather than skipping past it.
+                stopped_at = n
+                LOG.error(
+                    "sweep: byNumber/%s failed http=%s %s -- stopping at this invoice",
+                    n, st, str(inv)[:180],
+                )
+                break
+
+            if highest > watermark:
                 conn.execute(
                     "INSERT INTO meta(k,v) VALUES('sweep_last_invoice_number',?) "
                     "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
                     (str(highest),),
                 )
+
+            if reached_end:
                 LOG.info(
-                    "sweep complete: pages=%s scanned=%s new=%s watermark %.0f -> %.0f",
-                    pages, scanned, added, watermark, highest,
+                    "sweep complete: scanned=%s new=%s watermark %s -> %s",
+                    scanned, added, watermark, highest,
+                )
+            elif stopped_at:
+                LOG.warning(
+                    "sweep stopped at invoice %s after scanning %s; watermark %s -> %s "
+                    "(resumes from there next run)",
+                    stopped_at, scanned, watermark, highest,
                 )
             else:
-                # Truncated walk: do NOT advance the watermark. Advancing on a
-                # partial scan would skip every invoice past the page cap
-                # permanently. Re-scanning is cheap -- enqueue() de-duplicates.
                 LOG.warning(
-                    "sweep truncated at %s pages (max %s); watermark left at %.0f",
-                    pages, SWEEP_MAX_PAGES, watermark,
+                    "sweep hit its per-run cap of %s invoices; watermark %s -> %s "
+                    "(resumes from there next run)",
+                    SWEEP_MAX_INVOICES, watermark, highest,
                 )
 
             if once:
@@ -817,12 +1227,26 @@ def run_status() -> int:
         print(f"litellm       : {LITELLM_URL}  master_key_set={bool(LITELLM_KEY)}"
               f"  prefixed={LITELLM_KEY.startswith('sk-')}")
         print(f"verify        : {VERIFY}  killbill_configured={killbill_configured()}")
+        print(f"worker lease  : {LEASE_SECONDS}s  owner={WORKER_OWNER}  reap_batch={REAP_BATCH}")
+        print(f"sweep scope   : from watermark forward, max {SWEEP_MAX_INVOICES} invoices/run")
         print()
         print("events by status:")
         for r in conn.execute(
             "SELECT status, COUNT(*) c FROM events GROUP BY status ORDER BY status"
         ):
             print(f"   {r['status']:12} {r['c']}")
+        # A row whose lease expired is invisible everywhere else: not pending (no
+        # worker takes it) and not failed (nothing alarms). Surface it here.
+        now = time.time()
+        stuck = conn.execute(
+            "SELECT COUNT(*) c FROM events WHERE status='processing' "
+            "AND lease_expires_at IS NOT NULL AND lease_expires_at < ?",
+            (now,),
+        ).fetchone()["c"]
+        held = conn.execute(
+            "SELECT COUNT(*) c FROM events WHERE status='processing'"
+        ).fetchone()["c"]
+        print(f"   lease held   {held}   abandoned (expired, awaiting reclaim) {stuck}")
         print()
         print("recent events:")
         for r in conn.execute(

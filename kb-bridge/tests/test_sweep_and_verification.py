@@ -47,9 +47,17 @@ def env_read():
 
 
 def env_write(updates):
+    """Write config values. An EMPTY value means DELETE the key, never `KEY=`.
+
+    A present-but-blank value is not the same as an absent one: the bridge's
+    os.environ.get(name, default) returns "" and float("") crashed at import
+    (Bug #155). Restores must remove the line, not blank it.
+    """
     text = open(ENVF, encoding="utf-8").read()
     for k, v in updates.items():
-        if re.search(rf"^{re.escape(k)}=.*$", text, flags=re.M):
+        if v == "":
+            text = re.sub(rf"^{re.escape(k)}=.*$\n?", "", text, flags=re.M)
+        elif re.search(rf"^{re.escape(k)}=.*$", text, flags=re.M):
             text = re.sub(rf"^{re.escape(k)}=.*$", f"{k}={v}", text, flags=re.M)
         else:
             text += f"\n{k}={v}\n"
@@ -145,7 +153,7 @@ def main():
         print("  mock credentials installed; worker restarted (VERIFY=1)")
 
         print()
-        print("=== TEST 1: sweep finds the ONE fully-paid invoice, skips the other two ===")
+        print("=== TEST 1: sweep finds the ONE fully-paid invoice, skips the other three ===")
         r = bridge("sweep", "--once")
         logline = (r.stdout + r.stderr).strip().splitlines()
         for line in logline[-3:]:
@@ -156,10 +164,15 @@ def main():
         check("it is the fully-paid invoice", ids == ["inv-mock-paid-1"], str(ids))
         check("partial (balance>0) skipped", "inv-mock-unpaid" not in ids, str(ids))
         check("DRAFT skipped", "inv-mock-draft" not in ids, str(ids))
+        # A fully-paid invoice with NO payment on record was settled by credit, so
+        # no money moved and no budget may be granted.
+        check("credit-only (no payment) skipped", "inv-mock-credit" not in ids, str(ids))
+        check("walk terminated cleanly via the 4018 end sentinel",
+              any("sweep complete" in ln for ln in logline), str(logline[-1:])[:130])
 
         wm = sql("SELECT v FROM meta WHERE k='sweep_last_invoice_number'")
-        check("watermark advanced to highest number (12)",
-              wm and wm[0]["v"] == "12.0", str(wm))
+        check("watermark advanced to the highest number (13)",
+              bool(wm) and wm[0]["v"] in ("13", "13.0"), str(wm))
 
         print()
         print("=== TEST 2: second sweep enqueues nothing (watermark works) ===")
@@ -228,13 +241,28 @@ def main():
         check("budget still untouched", budget_value() == 5.0, f"max_budget={budget_value()}")
 
         print()
-        print("=== TEST 6: mock actually received invoice-shaped requests ===")
+        print("=== TEST 6: the sweep walked by NUMBER, never paged from offset 0 ===")
         with urllib.request.urlopen(f"{MOCK}/__hits", timeout=10) as r:
             hits = json.loads(r.read().decode())
+        bynum = [h for h in hits if "invoices/byNumber/" in h]
         pag = [h for h in hits if "invoices/pagination" in h]
+        pay = [h for h in hits if "/payments" in h]
         det = [h for h in hits if re.search(r"/invoices/inv-mock-", h)]
-        check("sweep hit invoices/pagination (not payments)", len(pag) >= 2, f"{len(pag)} calls")
+        # Bug #151: paging from offset 0 with a page cap is blind past
+        # SWEEP_MAX_PAGES*100 invoices, and it is blind in the worst possible way
+        # -- silently, and only once the tenant is big enough to matter.
+        check("sweep walked byNumber", len(bynum) >= 4, f"{len(bynum)} calls")
+        check("sweep did NOT page from offset 0", len(pag) == 0, f"{len(pag)} calls")
+        check("sweep read /payments for the idempotency identity", len(pay) >= 1,
+              f"{len(pay)} calls")
         check("worker hit the invoice detail endpoint", len(det) >= 1, f"{len(det)} calls")
+        # Gap tolerance: invoice numbers 1-9 do not exist in the mock, yet the walk
+        # had to pass through them to reach invoice 10. Stopping at the first
+        # missing number would stall reconciliation permanently at that gap.
+        before10 = [h for h in bynum
+                    if h.rsplit("/", 1)[-1].isdigit() and int(h.rsplit("/", 1)[-1]) < 10]
+        check("gap tolerance: probed missing numbers below 10 before finding it",
+              len(before10) >= 9, f"{len(before10)} probes")
 
     finally:
         print()
