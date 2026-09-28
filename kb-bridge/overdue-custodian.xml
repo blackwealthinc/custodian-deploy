@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Custodian — Kill Bill overdue ladder (tenant: custodian)
+  AUTHORED 2026-09-24. Source-verified against killbill-0.24.21.
+
+  RULES THIS CONFIG OBEYS (verified in source, not assumed):
+  1. States are evaluated IN ORDER and the FIRST match wins
+     (DefaultOverdueStateSet.calculateOverdueState). => WORST MUST COME FIRST.
+  2. No explicit "clear" state is needed - CLEAR is synthesized internally
+     (DefaultOverdueStateSet field initialiser).
+  3. All non-null conditions in a <condition> block are ANDed.
+  4. The time condition counts from the invoice's invoiceDate, NOT its dueDate
+     (BillingStateCalculator: dateOfEarliestUnpaidInvoice = invoice.getInvoiceDate()).
+     => the window cannot be anchored to a due date. It is a flat age limit.
+  5. Allowed units are DAYS / WEEKS / MONTHS / YEARS only (DefaultDuration.toJodaPeriod).
+     => the FASTEST testable time threshold is 1 DAY. See the test note at the bottom.
+
+  LADDER (mirrors the bridge's three actions):
+    CUST_OD1_WARNING   day 7+   plan changes blocked, NOTHING cut   -> notify only
+    CUST_OD2_BLOCKED   day 14+  entitlement blocked, NOT cancelled  -> kill the AI budget
+    CUST_OD3_CANCEL    day 30+  cancel at END_OF_TERM               -> existing cancel path
+
+  The $1.00 balance floor stops a stray trivial invoice from ever triggering the ladder.
+  disableEntitlementAndChangesBlocked=true does NOT cancel anything while
+  subscriptionCancellationPolicy is left at its NONE default (OverdueStateApplicator
+  only cancels when the policy != NONE) - so OD1 and OD2 are fully reversible by payment.
+-->
+<overdueConfig xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+               xsi:noNamespaceSchemaLocation="https://docs.killbill.io/latest/overdue.xsd">
+    <accountOverdueStates>
+
+        <!-- WORST FIRST -->
+        <state name="CUST_OD3_CANCEL">
+            <condition>
+                <totalUnpaidInvoiceBalanceEqualsOrExceeds>1.00</totalUnpaidInvoiceBalanceEqualsOrExceeds>
+                <timeSinceEarliestUnpaidInvoiceEqualsOrExceeds>
+                    <unit>DAYS</unit><number>30</number>
+                </timeSinceEarliestUnpaidInvoiceEqualsOrExceeds>
+            </condition>
+            <externalMessage>Subscription will be cancelled for non-payment.</externalMessage>
+            <blockChanges>true</blockChanges>
+            <disableEntitlementAndChangesBlocked>true</disableEntitlementAndChangesBlocked>
+            <subscriptionCancellationPolicy>END_OF_TERM</subscriptionCancellationPolicy>
+            <autoReevaluationInterval>
+                <unit>DAYS</unit><number>1</number>
+            </autoReevaluationInterval>
+        </state>
+
+        <state name="CUST_OD2_BLOCKED">
+            <condition>
+                <totalUnpaidInvoiceBalanceEqualsOrExceeds>1.00</totalUnpaidInvoiceBalanceEqualsOrExceeds>
+                <timeSinceEarliestUnpaidInvoiceEqualsOrExceeds>
+                    <unit>DAYS</unit><number>14</number>
+                </timeSinceEarliestUnpaidInvoiceEqualsOrExceeds>
+            </condition>
+            <externalMessage>Service suspended pending payment.</externalMessage>
+            <blockChanges>true</blockChanges>
+            <disableEntitlementAndChangesBlocked>true</disableEntitlementAndChangesBlocked>
+            <autoReevaluationInterval>
+                <unit>DAYS</unit><number>1</number>
+            </autoReevaluationInterval>
+        </state>
+
+        <state name="CUST_OD1_WARNING">
+            <condition>
+                <totalUnpaidInvoiceBalanceEqualsOrExceeds>1.00</totalUnpaidInvoiceBalanceEqualsOrExceeds>
+                <timeSinceEarliestUnpaidInvoiceEqualsOrExceeds>
+                    <unit>DAYS</unit><number>7</number>
+                </timeSinceEarliestUnpaidInvoiceEqualsOrExceeds>
+            </condition>
+            <externalMessage>Payment overdue - please pay to avoid suspension.</externalMessage>
+            <blockChanges>true</blockChanges>
+            <disableEntitlementAndChangesBlocked>false</disableEntitlementAndChangesBlocked>
+            <autoReevaluationInterval>
+                <unit>DAYS</unit><number>1</number>
+            </autoReevaluationInterval>
+        </state>
+
+    </accountOverdueStates>
+</overdueConfig>
+
+<!--
+  TESTING NOTE (important):
+  The time unit floor is DAYS, so a time-based transition cannot be tested instantly.
+  To prove the mechanism fires and to capture the exact bus event the bridge receives,
+  temporarily POST a config whose ONLY state is:
+
+      <state name="CUST_TEST_BLOCK">
+        <condition>
+          <numberOfUnpaidInvoicesEqualsOrExceeds>1</numberOfUnpaidInvoicesEqualsOrExceeds>
+        </condition>
+        ...
+      </state>
+
+  That fires the moment a single unpaid invoice exists. Restore this file afterwards.
+
+  REVERT TO DISABLED: POST <accountOverdueStates/> (empty) - no state can then match,
+  so every account resolves to the synthesized CLEAR state.
+-->

@@ -1,5 +1,9 @@
 # E2E paid-path runbook — Kill Bill → LiteLLM budget
 
+> **Companion doc:** `catalog/stripe-plugin-install-runbook.md` (2026-09-24).
+> This runbook exercises the paid path using **`__EXTERNAL_PAYMENT__`** — a *manually recorded* payment. That remains the correct path for **crypto** (gateway webhook → bridge → external payment) and for testing.
+> **For real card customers, the Stripe plugin replaces steps 2–5** (`PaymentMethod` + `InvoicePayment` are created by the plugin). Install it via the companion runbook **before** pointing a paying reseller at it — and note that runbook's §1: on this box a plugin installed without the persistent mount **disappears on container recreation.**
+
 The exact sequence that was executed on 2026-09-18 to prove the money loop.
 Every step below is a real command that returned the stated result. Use this to
 re-run, to demo, or to debug when the loop breaks.
