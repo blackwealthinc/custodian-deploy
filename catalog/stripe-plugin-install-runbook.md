@@ -326,15 +326,31 @@ instead *merges* all active rows — different mechanism, so check the specific 
 when creating a payment method.
 
 ### Step 6 — Prove it with real money, in order
-1. `POST /plugins/killbill-stripe/checkout?kbAccountId=<id>&successUrl=…&cancelUrl=…`
-   ⚠️ **NOT YET WORKING (2026-09-28):** with `kbAccountId` + `kbInvoiceId` + `successUrl` + `cancelUrl`
-   this returns **400 `java.lang.NullPointerException`**. The servlet reads `kbAccountId`/`kb_account_id`,
-   `kbInvoiceId`/`kb_invoice_id`, `successUrl`/`success_url`, `cancelUrl`/`cancel_url`. Needs investigation
-   before the checkout flow can be exercised — do not assume the parameter set above is complete.
-2. **Open the returned URL in a real browser** — confirm the hosted page renders
-3. Card entry runs in **`mode: "setup"` → ⚠️ charges $0.** Save the card; confirm it appears in Kill Bill
-4. Registering the card needs **`addPaymentMethod?pluginProperty=sessionId=cs_…`** or `PUT /accounts/{id}/paymentMethods/refresh` — *which of these Kaui does for us is UNVERIFIED*
-5. **Then** one small **real** charge, on our own card, and **refund it**
+1. **WORKING invocation — verified end-to-end 2026-09-28 (HTTP 201, live session created):**
+   ```bash
+   curl -X POST -H "Content-Type: application/x-www-form-urlencoded" \
+     -H "X-Killbill-CreatedBy: custodian-deploy" \
+     --data "kbAccountId=<account-uuid>&successUrl=<url>&cancelUrl=<url>" \
+     "$KB/plugins/killbill-stripe/checkout"
+   ```
+   Returns **201** with a `formFields[]` array holding `id` (`cs_live_…`), `customer_id`, `setup_intent_id`, `livemode: true`.
+   ⚠️ **It must be form-encoded WITH a body, and `kbAccountId` must be a parseable UUID.** Three distinct failure modes:
+   - **No body / no content-type** → Kill Bill routes to `PluginResource.doFormPOST` with a `null` form →
+     `createInputStream` NPEs at `PluginResource.java:252` (`for (final String key : form.keySet())`).
+     That is a **Kill Bill** defect, not the plugin's, and it fires *before* the plugin is ever invoked.
+     A plain `curl -X POST` with no body hits exactly this — it is easy to misread as "the plugin is broken".
+   - **Non-UUID `kbAccountId`** → `org.jooby.Err: Server Error(500): Failed to parse parameter 'kbAccountId' to 'java.util.UUID'`.
+   - **Nonexistent account** → 500 (the plugin’s `getAccount()` throws) but creates **no** Stripe object.
+   On success the plugin runs, in order: `Customer.create` at Stripe → writes a `STRIPE_CUSTOMER_ID` custom field on the
+   KB account → `Session.create` (mode=setup ⇒ **$0**) → inserts a `stripe_hpp_requests` row → returns the descriptor.
+2. **Fetch the hosted URL from Stripe** — the descriptor returns the session `id`, *not* the URL:
+   `GET https://api.stripe.com/v1/checkout/sessions/<cs_id>` → `.url`
+3. **Open that URL in a real browser.** ✅ Verified 2026-09-28: page headed "BlackWealth, Inc" with
+   "Save payment information", Card/Bank options, card fields, and the KB account's email pre-filled.
+   `publicKey` is optional — `toAdditionalDataMap(session, @Nullable pk)` simply omits `publishable_key` when unset.
+4. Card entry runs in **`mode: "setup"` → ⚠️ charges $0.** Save the card; confirm it appears in Kill Bill
+5. Registering the card needs **`addPaymentMethod?pluginProperty=sessionId=cs_…`** or `PUT /accounts/{id}/paymentMethods/refresh` — *which of these Kaui does for us is UNVERIFIED*
+6. **Then** one small **real** charge, on our own card, and **refund it**
 
 ---
 
