@@ -10,6 +10,7 @@ UNPLEASANT parts of the real contract -- a permissive mock hides exactly the
 bugs the suite exists to catch.
 
 Routes
+  GET /1.0/kb/invoices/search/{key}                the DOCUMENTED balance search (what the sweep uses)
   GET /1.0/kb/invoices/pagination?offset=&limit=   enumeration ONLY (see below)
   GET /1.0/kb/invoices/byNumber/{n}                FULL invoice | 400 code 4018
   GET /1.0/kb/invoices/{id}                        FULL invoice | 404
@@ -18,13 +19,17 @@ Routes
   GET /__hits                                      request log (test-only)
 """
 import json
+import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 # Real engine behaviour: the invoice DETAIL endpoints load invoice items, so
 # `amount` and `balance` there are authoritative. The LIST endpoint does not, and
 # Kill Bill's DefaultInvoice computes BOTH of those fields FROM the items -- so
 # the list reports 0.0/0.0 for an invoice that genuinely carries a balance.
+# The BALANCE SEARCH is the documented exception: its balance is computed in SQL
+# (SUM(items) - SUM(successful payments)) so it is authoritative with no items.
+# All three behaviours are reproduced here, each verified live on .104.
 INVOICES = [
     {   # 10: fully paid by ONE successful payment -> the sweep MUST enqueue this
         "invoiceId": "inv-mock-paid-1", "accountId": "acct-mock-1",
@@ -94,11 +99,13 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def _send(self, code, obj):
+    def _send(self, code, obj, extra_headers=None):
         body = json.dumps(obj).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        for k, v in (extra_headers or {}).items():
+            self.send_header(k, v)
         self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
@@ -119,6 +126,61 @@ class H(BaseHTTPRequestHandler):
 
         if path == "/__hits":
             self._send(200, HITS)
+            return
+
+        if path.startswith("/1.0/kb/invoices/search/"):
+            key = unquote(path[len("/1.0/kb/invoices/search/"):])
+            limit, offset = 100, 0
+            for part in qs.split("&"):
+                if part.startswith("limit="):
+                    limit = int(part.split("=", 1)[1])
+                elif part.startswith("offset="):
+                    offset = int(part.split("=", 1)[1])
+
+            # REAL: `_q=1&balance[<cmp>]=<v>` is matched against the WHOLE search
+            # key, and it is the ONLY form whose balance is usable.
+            m = re.fullmatch(r"_q=1&balance\[(eq|gte|gt|lte|lt|neq)\]=(-?[\d.]+)", key)
+            if m:
+                op, val = m.group(1), float(m.group(2))
+                cmp_ = {
+                    "eq": lambda a, b: a == b,
+                    "gte": lambda a, b: a >= b,
+                    "gt": lambda a, b: a > b,
+                    "lte": lambda a, b: a <= b,
+                    "lt": lambda a, b: a < b,
+                    "neq": lambda a, b: a != b,
+                }[op]
+                sel = [i for i in INVOICES if cmp_(float(i["balance"]), val)]
+                # REAL (verified live 2026-09-28): this path returns the
+                # SQL-computed balance -- authoritative -- but NO items, and
+                # `amount` comes back 0.0. Reproduced so the sweep cannot come to
+                # depend on `amount` or on items being present here.
+                page = [{**i, "amount": 0.0, "items": []}
+                        for i in sel[offset:offset + limit]]
+                hdrs = {
+                    "X-Killbill-Pagination-CurrentOffset": str(offset),
+                    "X-Killbill-Pagination-TotalNbRecords": str(len(sel)),
+                }
+                if offset + limit < len(sel):
+                    # REAL: present ONLY when further entries exist.
+                    hdrs["X-Killbill-Pagination-NextOffset"] = str(offset + limit)
+                self._send(200, page, hdrs)
+                return
+
+            if key.startswith("_q=1"):
+                # REAL: the FIELD search form filters correctly but reports
+                # `balance: null` -- which is exactly why it cannot drive the
+                # sweep's decision. A regression to this form must fail loudly.
+                self._send(200, [
+                    {**i, "balance": None, "amount": 0.0, "items": []}
+                    for i in INVOICES[offset:offset + limit]
+                ])
+                return
+
+            # Basic search: substring match on invoiceId / accountId / currency.
+            hits = [i for i in INVOICES
+                    if key in (i["invoiceId"], i["accountId"], i["currency"])]
+            self._send(200, hits[offset:offset + limit])
             return
 
         if path == "/1.0/kb/invoices/pagination":

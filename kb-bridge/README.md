@@ -111,28 +111,59 @@ Retries use exponential backoff (15 s → 15 min) up to `KB_MAX_ATTEMPTS`, then 
 
 ## The sweep (reconciliation)
 
-Reads **invoices**, not payments:
+Reads **invoices**, not payments — the documented **balance search**:
 
 ```
-GET /1.0/kb/invoices/pagination?offset=N&limit=100&audit=true
-  → keep invoices with status == COMMITTED and balance == 0
-  → enqueue as INVOICE_PAYMENT_SUCCESS
+GET /1.0/kb/invoices/search/_q=1&balance[lte]=0&offset=N&limit=200
+  → keep invoices with status == COMMITTED
+  → enqueue as INVOICE_PAYMENT_SUCCESS, identified by the payment below it
 ```
 
-A `sweep_last_invoice_number` watermark avoids re-processing. **The watermark is only advanced when the walk completes** — on a truncated walk (page cap reached) it is deliberately left alone, because advancing on a partial scan would skip every invoice past the cap permanently. Re-scanning is cheap since `enqueue()` de-duplicates.
+(`[` `]` `%` **must** be URL-encoded; the constant in the code holds the encoded
+form. `lte` rather than `eq` also catches an overpaid invoice whose balance went
+negative — the extra rows are rejected by the same guards.)
 
-⚠️ **The sweep never trusts a money field from the list response.** Kill Bill's
-`/invoices/pagination` does not load invoice items, and `DefaultInvoice` computes
-**both** `amount` (`getChargedAmount`) and `balance` (`getBalance`) *from* those
-items — so an unpaid invoice with a real $59 balance reports `balance: 0.0` there.
-Verified live 2026-09-18. The old code trusted that field and emitted a false
-`INVOICE_PAYMENT_SUCCESS` for a genuinely unpaid invoice (`scanned=2 new=1`); the
-worker's fail-closed verification refused it, but a sweep must not lie and rely on
-a downstream guard. The sweep now re-reads each candidate via
-`GET /1.0/kb/invoices/{id}` and only enqueues on the *authoritative* status and
-balance. `tests/mock_killbill.py` reproduces the quirk (list returns
-`balance: 0.0` for everything) so the suite fails if anyone reintroduces the
-shortcut — verified: reverting the fix drops the suite to **10/15**.
+Termination uses the documented pagination contract: keep paging while
+`X-Killbill-Pagination-NextOffset` is present. There is **no cursor and no
+watermark** — every run re-reads the whole set from `offset=0`, so a run
+interrupted half way loses nothing, and there is nothing to corrupt.
+
+⚠️ **`KB_SWEEP_MAX_PAGES` truncates coverage, so hitting it is a WARNING.** The
+run logs `sweep INCOMPLETE: … Coverage was NOT complete` and tells you to raise
+the cap. Bug #151's lesson was that a reconciliation walk can go blind
+*silently*; the one way to be blind here is therefore made loud.
+
+**Why not walk invoice numbers?** `invoiceNumber` *is* `invoices.record_id` — a
+per-table auto-increment shared by every tenant in the database, so it is dense
+only in a single-tenant install. The previous walk probed `watermark+1` upward
+and needed 50 consecutive misses (`KB_SWEEP_MAX_GAPS`) before it would accept that
+history had ended: a 51-record gap ended reconciliation early and *silently*, and
+a tenant with two invoices still re-probed the same 50 dead numbers every run —
+50 engine stack traces and ~700 KB of engine log **per run**, ~67 MB/day
+(measured 2026-09-28, Bug #157). The balance search asks the question we actually
+have and is indifferent to numbers.
+
+**Why not a date cursor?** `/accounts/{id}/invoices?startDate=…` filters
+`target_date` — a service-period *business* date that can be backdated — so a late
+correction would never be seen again. And the field-search form
+(`_q=1&created_date[gte]=…`) returns `balance: null`, so it cannot decide
+paid/unpaid at all. `InvoiceJson` exposes no `createdDate`.
+
+⚠️ **The sweep never trusts a money field from a plain LIST response.** Kill
+Bill's `/invoices/pagination` and `/accounts/{id}/invoices` do not load invoice
+items, and `DefaultInvoice` computes **both** `amount` (`getChargedAmount`) and
+`balance` (`getBalance`) *from* those items — so an unpaid invoice with a real $59
+balance reports `balance: 0.0` there. Verified live 2026-09-18 **and again
+2026-09-28**. The official docs say it outright: shallow invoices "unless
+`includeInvoiceComponents=true` is specified".
+
+The balance search is the exception that makes the new design possible: its
+balance is computed in SQL (`SUM(items) − SUM(successful payments)`), so it is
+authoritative *without* items. `tests/mock_killbill.py` reproduces all three
+behaviours — the shallow list lying, the balance search being authoritative, and
+the field-search form returning `balance: null` — so the suite fails if anyone
+switches to a path that cannot answer the question. Verified: reverting to the
+shallow list drops the suite to **10/15**.
 
 **About `audit` — corrected 2026-09-18.** An earlier version of this file said
 "Spec ≠ implementation" and told you never to send `audit`. **That was wrong.**
@@ -177,7 +208,8 @@ because `NONE` is already the default.
 | `KB_RECV_BUSY_TIMEOUT_MS` | `250` | receiver fail-fast on lock contention |
 | `KB_MAX_CONCURRENT` | `32` | receiver in-flight request cap |
 | `KB_RECV_SLOT_WAIT_SECONDS` | `0.15` | wait for a slot before shedding |
-| `KB_SWEEP_MAX_PAGES` | `20` | page cap per sweep run |
+| `KB_SWEEP_PAGE_SIZE` | `200` | invoices fetched per page request |
+| `KB_SWEEP_MAX_PAGES` | `20` | page cap per sweep run; hitting it logs `sweep INCOMPLETE` |
 | `KB_SWEEP_INTERVAL_SECONDS` | `900` | markdown sleep between sweeps |
 | `KB_MAX_ATTEMPTS` | `8` | then park as `failed` |
 
@@ -192,7 +224,10 @@ Wrong token → `404` (no endpoint disclosure). Replay → `duplicate: true`. Ov
 **Behaviour — 15/15 checks passed** against a mock Kill Bill plus 9/9 on the live LiteLLM path:
 
 - sweep picks up the *one* fully-paid invoice and skips partial (`balance > 0`) and `DRAFT` ones
-- watermark advances on a complete walk; a second sweep enqueues nothing
+- the run reports `pages=`, `examined=`, `enqueued=`, `skipped_known=` and the engine's `set_size=`
+- a second sweep enqueues nothing (the known invoice is skipped, not re-decided)
+- forcing `KB_SWEEP_PAGE_SIZE=1` pages the whole set and stops on `NextOffset`
+- forcing `KB_SWEEP_MAX_PAGES=1` logs `sweep INCOMPLETE` — a capped scan is never silent
 - verification **accepts** a genuinely paid invoice → budget `0.0 → 5.0`, confirmed by LiteLLM
 - verification **refuses** a partially-paid invoice (`balance=12.5`) — budget unchanged
 - verification **refuses** a `DRAFT` invoice — `not committed`

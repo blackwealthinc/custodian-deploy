@@ -122,7 +122,8 @@ def main():
     cfg0 = env_read()
     original = {k: cfg0.get(k, "") for k in
                 ("KB_KILLBILL_URL", "KB_KILLBILL_API_KEY", "KB_KILLBILL_API_SECRET",
-                 "KB_KILLBILL_USER", "KB_KILLBILL_PASSWORD", "KB_VERIFY")}
+                 "KB_KILLBILL_USER", "KB_KILLBILL_PASSWORD", "KB_VERIFY",
+                 "KB_SWEEP_PAGE_SIZE", "KB_SWEEP_MAX_PAGES")}
     test_key = None
 
     try:
@@ -167,20 +168,32 @@ def main():
         # A fully-paid invoice with NO payment on record was settled by credit, so
         # no money moved and no budget may be granted.
         check("credit-only (no payment) skipped", "inv-mock-credit" not in ids, str(ids))
-        check("walk terminated cleanly via the 4018 end sentinel",
+        check("balance search ran to the documented end of the set",
               any("sweep complete" in ln for ln in logline), str(logline[-1:])[:130])
+        # Bug #157: the balance search must not have to walk any invoice NUMBER,
+        # so a missing number can no longer end reconciliation early.
+        check("the run reported the set size from the pagination header",
+              any("set_size=" in ln for ln in logline), str(logline[-1:])[:130])
 
+        # Bug #157: `sweep_last_invoice_number` is now OBSERVABILITY ONLY -- it is
+        # reported, never read back as a cursor.
         wm = sql("SELECT v FROM meta WHERE k='sweep_last_invoice_number'")
-        check("watermark advanced to the highest number (13)",
+        check("high-water mark reported for operators (highest number seen = 13)",
               bool(wm) and wm[0]["v"] in ("13", "13.0"), str(wm))
 
         print()
-        print("=== TEST 2: second sweep enqueues nothing (watermark works) ===")
+        print("=== TEST 2: second sweep enqueues nothing (re-run is inert) ===")
         r = bridge("sweep", "--once")
         for line in (r.stdout + r.stderr).strip().splitlines()[-2:]:
             print("  log: " + line.strip()[:150])
         rows2 = sql("SELECT COUNT(*) c FROM events WHERE account_id LIKE 'acct-mock-%'")
         check("still exactly 1 event", rows2[0]["c"] == 1, f"count={rows2[0]['c']}")
+        # The already-recorded invoice is skipped without even a /payments call.
+        # (The underlying UNIQUE-constraint de-dupe is covered by
+        # test_idempotency_and_lease.py, which exists for exactly that.)
+        check("re-run skipped the known invoice instead of re-deciding it",
+              any("skipped_known=1" in ln for ln in (r.stdout + r.stderr).splitlines()),
+              str((r.stdout + r.stderr).strip().splitlines()[-1:])[:130])
 
         print()
         print("=== TEST 3: the FIXED verification accepts a genuinely paid invoice ===")
@@ -241,28 +254,73 @@ def main():
         check("budget still untouched", budget_value() == 5.0, f"max_budget={budget_value()}")
 
         print()
-        print("=== TEST 6: the sweep walked by NUMBER, never paged from offset 0 ===")
+        print("=== TEST 6 (Bug #157): the sweep used the BALANCE SEARCH, never walked numbers ===")
         with urllib.request.urlopen(f"{MOCK}/__hits", timeout=10) as r:
             hits = json.loads(r.read().decode())
+        search = [h for h in hits if "invoices/search/" in h]
+        bal = [h for h in search if "balance%5Blte%5D" in h]
         bynum = [h for h in hits if "invoices/byNumber/" in h]
         pag = [h for h in hits if "invoices/pagination" in h]
         pay = [h for h in hits if "/payments" in h]
         det = [h for h in hits if re.search(r"/invoices/inv-mock-", h)]
-        # Bug #151: paging from offset 0 with a page cap is blind past
-        # SWEEP_MAX_PAGES*100 invoices, and it is blind in the worst possible way
-        # -- silently, and only once the tenant is big enough to matter.
-        check("sweep walked byNumber", len(bynum) >= 4, f"{len(bynum)} calls")
-        check("sweep did NOT page from offset 0", len(pag) == 0, f"{len(pag)} calls")
+        check("sweep used the documented balance search", len(bal) >= 1,
+              f"{len(bal)} balance-search calls")
+        # Bug #157: the dead-number walk is GONE. If it ever returns, this fails --
+        # which is the point: it probed 50 dead numbers per run and measured
+        # ~700 KB of engine log PER RUN doing it (~67 MB/day, unbounded).
+        check("sweep made ZERO byNumber calls (the dead walk is gone)",
+              len(bynum) == 0, f"{len(bynum)} byNumber calls")
+        # Bug #151 + the 2026-09-18 false positive: the plain list endpoint returns
+        # SHALLOW invoices and reports balance 0.0 for an invoice that owes money.
+        check("sweep did NOT use the shallow /invoices/pagination list",
+              len(pag) == 0, f"{len(pag)} calls")
         check("sweep read /payments for the idempotency identity", len(pay) >= 1,
               f"{len(pay)} calls")
         check("worker hit the invoice detail endpoint", len(det) >= 1, f"{len(det)} calls")
-        # Gap tolerance: invoice numbers 1-9 do not exist in the mock, yet the walk
-        # had to pass through them to reach invoice 10. Stopping at the first
-        # missing number would stall reconciliation permanently at that gap.
-        before10 = [h for h in bynum
-                    if h.rsplit("/", 1)[-1].isdigit() and int(h.rsplit("/", 1)[-1]) < 10]
-        check("gap tolerance: probed missing numbers below 10 before finding it",
-              len(before10) >= 9, f"{len(before10)} probes")
+
+        def _hits():
+            with urllib.request.urlopen(f"{MOCK}/__hits", timeout=10) as rr:
+                return json.loads(rr.read().decode())
+
+        def _clear_mock_events():
+            conn2 = sqlite3.connect(DBF)
+            conn2.execute("DELETE FROM events WHERE account_id LIKE 'acct-mock-%'")
+            conn2.commit()
+            conn2.close()
+
+        print()
+        print("=== TEST 7 (Bug #157): the sweep pages the WHOLE set and stops on NextOffset ===")
+        _clear_mock_events()
+        env_write({"KB_SWEEP_PAGE_SIZE": "1", "KB_SWEEP_MAX_PAGES": "20"})
+        n0 = len(_hits())
+        r = bridge("sweep", "--once")
+        out = r.stdout + r.stderr
+        pages2 = [h for h in _hits()[n0:] if "invoices/search/" in h]
+        rows7 = sql("SELECT * FROM events WHERE object_id='inv-mock-paid-1'")
+        # Three mock invoices have balance <= 0 (paid, DRAFT, credit-only), so
+        # page_size=1 must issue 3 requests: two carrying NextOffset, one without.
+        check("page_size=1 forced one request per invoice", len(pages2) >= 3,
+              f"{len(pages2)} page requests")
+        check("paging still found exactly the right invoice", len(rows7) == 1,
+              f"rows={len(rows7)}")
+        check("paged run reported completion", "sweep complete" in out, out.strip()[-130:])
+
+        print()
+        print("=== TEST 8 (Bug #157): hitting the page cap is VISIBLE, never silent ===")
+        _clear_mock_events()
+        env_write({"KB_SWEEP_PAGE_SIZE": "1", "KB_SWEEP_MAX_PAGES": "1"})
+        r = bridge("sweep", "--once")
+        out = r.stdout + r.stderr
+        check("page cap produced an explicit INCOMPLETE warning",
+              "sweep INCOMPLETE" in out, out.strip()[-160:])
+        check("the warning states coverage was NOT complete",
+              "NOT complete" in out, out.strip()[-160:])
+        # Blanking an env key deletes it (Bug #155), so this also proves the new
+        # page knobs fall back to their defaults instead of raising at import.
+        env_write({"KB_SWEEP_PAGE_SIZE": "", "KB_SWEEP_MAX_PAGES": ""})
+        r = bridge("sweep", "--once")
+        check("blank page knobs fall back to defaults and the sweep still runs",
+              "sweep complete" in (r.stdout + r.stderr), (r.stdout + r.stderr).strip()[-130:])
 
     finally:
         print()

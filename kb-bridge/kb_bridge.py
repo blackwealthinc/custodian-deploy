@@ -155,18 +155,30 @@ LEASE_SECONDS = float(cfg("KB_LEASE_SECONDS", "600"))
 REAP_BATCH = int(cfg("KB_REAP_BATCH", "100"))
 WORKER_OWNER = f"{socket.gethostname()}:{os.getpid()}"
 
-# --- sweep scope (Bug #151) ------------------------------------------------ #
-# The sweep walks FORWARD BY INVOICE NUMBER, so this bounds one run's work
-# rather than bounding how far into history we are ever able to see. Each step
-# is one byNumber call. 200 absorbs a long outage; the next run continues from
-# the advanced watermark.
-SWEEP_MAX_INVOICES = int(cfg("KB_SWEEP_MAX_INVOICES", "200"))
-# Invoice numbers are per-tenant and normally contiguous, but a number CAN be
-# consumed without an invoice surviving (aborted generation). Treating the first
-# missing number as the end of history would stall the walk at that gap forever --
-# the same permanent-blindness failure the byNumber walk exists to remove. So the
-# end of the sequence is only declared after this many consecutive misses.
-SWEEP_MAX_GAPS = int(cfg("KB_SWEEP_MAX_GAPS", "50"))
+# --- sweep scope (Bug #151 -> Bug #157) ------------------------------------ #
+# Bug #157 replaced the byNumber walk with the documented balance search, so
+# this is now a PAGE budget, not an invoice-number budget. 20 pages x 200 per
+# page = 4,000 invoices examined per run.
+#
+# It is deliberately a page cap and not a generous number cap: if it is ever hit
+# the run logs a WARNING saying coverage was NOT complete. Bug #151's lesson was
+# that a walk can go blind silently -- so the one way to be blind here is made
+# visible instead of made unlikely.
+SWEEP_PAGE_SIZE = int(cfg("KB_SWEEP_PAGE_SIZE", "200"))
+SWEEP_MAX_PAGES = int(cfg("KB_SWEEP_MAX_PAGES", "20"))
+
+# URL-encoded `_q=1&balance[lte]=0` -- the documented balance search
+# (`GET /1.0/kb/invoices/search/{searchKey}`). Verified live against 0.24.21.
+# URL-encoding is REQUIRED (killbill.github.io/slate/invoice.html): `[` -> %5B,
+# `]` -> %5D, `%` -> %25. `&` and `=` are encoded too so the whole search key
+# stays ONE url path segment; JAX-RS decodes it back before the DAO sees it.
+#
+# `lte` and not `eq`: a fully-paid invoice has balance exactly 0, but an OVERPAID
+# one can be negative, and the SQL zeroes DRAFT/VOID/migrated/written-off rows --
+# all of which would be missed by `eq`. They are then rejected by the guards in
+# _sweep_consider_invoice (needs status COMMITTED + a SUCCESS PURCHASE payment),
+# so the superset costs a little work and cannot produce a false grant.
+SWEEP_BALANCE_QUERY = "_q%3D1%26balance%5Blte%5D%3D0"
 
 # --- receiver hardening ---------------------------------------------------- #
 # The receiver must NEVER park a Kill Bill event-bus thread. Kill Bill's shipped
@@ -340,8 +352,16 @@ def init_db(seed: bool = True) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def http_json(method: str, url: str, body: dict | None = None, headers: dict | None = None,
-              timeout: float = HTTP_TIMEOUT) -> tuple[int, dict | list | str]:
+def http_json_hdrs(method: str, url: str, body: dict | None = None, headers: dict | None = None,
+                   timeout: float = HTTP_TIMEOUT) -> tuple[int, dict | list | str, dict]:
+    """Same as http_json but also returns the response headers.
+
+    Exists because Kill Bill's pagination contract is expressed in HEADERS
+    (`X-Killbill-Pagination-NextOffset`, `-TotalNbRecords`), and the sweep needs
+    them to know when it has reached the end of a result set. Kept as a separate
+    function so http_json keeps its 2-tuple contract and none of its existing
+    callers change.
+    """
     data = json.dumps(body).encode() if body is not None else None
     hdrs = {"Content-Type": "application/json", "Accept": "application/json"}
     if headers:
@@ -350,18 +370,26 @@ def http_json(method: str, url: str, body: dict | None = None, headers: dict | N
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", "replace")
+            got = dict(resp.headers)
             try:
-                return resp.status, json.loads(raw) if raw else {}
+                return resp.status, json.loads(raw) if raw else {}, got
             except json.JSONDecodeError:
-                return resp.status, raw
+                return resp.status, raw, got
     except urllib.error.HTTPError as exc:
         raw = exc.read().decode("utf-8", "replace")
+        got = dict(exc.headers) if exc.headers else {}
         try:
-            return exc.code, json.loads(raw)
+            return exc.code, json.loads(raw), got
         except json.JSONDecodeError:
-            return exc.code, raw
+            return exc.code, raw, got
     except Exception as exc:  # noqa: BLE001 - network layer, we want the message
-        return 0, f"{type(exc).__name__}: {exc}"
+        return 0, f"{type(exc).__name__}: {exc}", {}
+
+
+def http_json(method: str, url: str, body: dict | None = None, headers: dict | None = None,
+              timeout: float = HTTP_TIMEOUT) -> tuple[int, dict | list | str]:
+    status, parsed, _ = http_json_hdrs(method, url, body, headers, timeout)
+    return status, parsed
 
 
 def litellm_headers() -> dict:
@@ -1169,11 +1197,27 @@ def _sweep_payment_id(invoice_id: str) -> tuple[str, str]:
 def _sweep_consider_invoice(conn: sqlite3.Connection, inv: dict) -> tuple[bool, str]:
     """Decide whether one invoice needs a payment event, and enqueue it.
 
-    `inv` must be a FULL invoice (from byNumber or by-id), never a list item --
-    the list endpoint does not load invoice items, so DefaultInvoice computes both
-    chargedAmount and balance from those items and reports 0.0 for an invoice that
-    genuinely has a balance. Trusting that manufactured a false
+    `inv` must carry an AUTHORITATIVE `balance`. There are exactly two read paths
+    that provide one, and both are proven live against 0.24.21:
+
+      * `GET /1.0/kb/invoices/byNumber/{n}` or `/invoices/{id}` -- the DETAIL
+        endpoints load invoice items, so DefaultInvoice's items-based balance is
+        real; and
+      * `GET /1.0/kb/invoices/search/_q=1&balance[...]` -- the BALANCE SEARCH,
+        whose balance is computed in SQL (`invoiceBalanceQuery`) and is therefore
+        real even though it returns no items at all.
+
+    What must NEVER be used is the plain LIST endpoint
+    (`/invoices/pagination`, `/accounts/{id}/invoices` without
+    `includeInvoiceComponents=true`). The official docs say it plainly: it
+    returns SHALLOW invoices with `amount`, `creditAdj`, `refundAdj` and
+    `balance` forced to 0. Verified live 2026-09-28 -- it reported balance 0.0
+    for an invoice genuinely owing $59. Trusting it manufactured a false
     INVOICE_PAYMENT_SUCCESS for an unpaid $59 invoice (observed 2026-09-18).
+
+    Both advanced search forms look alike but only one is safe: the FIELD form
+    (`_q=1&status=...`) returns `balance: null`. A missing balance is therefore
+    treated as a hard refusal below, never as "probably paid".
     """
     inv_id = inv.get("invoiceId")
     if not inv_id:
@@ -1185,7 +1229,13 @@ def _sweep_consider_invoice(conn: sqlite3.Connection, inv: dict) -> tuple[bool, 
 
     balance = inv.get("balance")
     if balance is None:
-        return False, "invoice returned no balance field"
+        # A missing balance means we read from a path that cannot answer the
+        # question (the field-search form). Refuse loudly: "no balance" must
+        # never be read as "no money owed".
+        return False, (
+            "REFUSING: invoice returned no balance field -- wrong read path "
+            "(the field-search form reports balance as null)"
+        )
     if float(balance) > 0:
         return False, f"not fully paid (balance={balance})"
 
@@ -1215,7 +1265,90 @@ def _sweep_consider_invoice(conn: sqlite3.Connection, inv: dict) -> tuple[bool, 
     return False, "already queued (duplicate)"
 
 
+def _sweep_already_recorded(conn: sqlite3.Connection, invoice_id: str) -> bool:
+    """Have we already enqueued a payment event for this invoice?
+
+    An OPTIMISATION, so that the cost of a run does not grow with every invoice
+    the tenant has ever had. Without it the sweep would re-read the whole paid
+    set each run AND spend one `/invoices/{id}/payments` call per invoice, so a
+    tenant with a few thousand paid invoices would fire a few thousand requests
+    every 15 minutes -- trading a log-bloat problem for a request storm.
+
+    Why skipping is safe here, stated plainly: if an event row already exists for
+    this invoice, a payment notification for that customer DID arrive. The
+    sweep's whole purpose is the opposite case -- the notification path is broken
+    for someone, so NO event exists. A customer with a broken path is therefore
+    still examined on every run.
+
+    The residual gap: a SECOND missed payment against an already-processed
+    invoice is not independently caught by the sweep. That case is the webhook's
+    (and Bug #149's per-`paymentId` identity fix is what makes two payments on
+    one invoice two distinct events). It is not silently ignored -- every run
+    reports `skipped_known=` in its summary line.
+
+    This can only ever skip work: anything already recorded is still
+    de-duplicated by `enqueue`'s UNIQUE constraint, so it can never double-apply.
+    """
+    return conn.execute(
+        "SELECT 1 FROM events WHERE object_id=? AND event_type=? LIMIT 1",
+        (invoice_id, ACTION_PAYMENT),
+    ).fetchone() is not None
+
+
 def run_sweep(once: bool = False) -> int:
+    """Find invoices that are fully paid but whose payment event never arrived.
+
+    This is the backstop for a missed webhook: if an `INVOICE_PAYMENT_SUCCESS` is
+    dropped, a paying customer stays cut off. The sweep re-derives the payment
+    from the engine and enqueues the identical event, so the webhook and the
+    sweep de-duplicate against each other.
+
+    Read path (Bug #157)
+    --------------------
+        GET /1.0/kb/invoices/search/_q=1&balance[lte]=0?offset=&limit=
+    the documented balance search -- instead of walking invoice NUMBERS from a
+    stored watermark.
+
+    Why the number walk is gone
+    ---------------------------
+    `invoiceNumber` IS `invoices.record_id` (`InvoiceSqlDao.sql.stg`:
+    `record_id as invoice_number`) -- a per-table auto-increment shared by EVERY
+    tenant in the database. It is dense only in a single-tenant install. The old
+    walk probed `watermark+1` upward and would only accept that history had ended
+    after `KB_SWEEP_MAX_GAPS` (50) consecutive misses, so on a shared database a
+    51-record gap ended the walk early and blinded reconciliation -- permanently,
+    and silently. And because a tenant holding two invoices still had to walk 50
+    dead numbers to discover that, it re-probed the same dead range on every run:
+    50 engine stack traces and ~700 KB of log per run (measured 2026-09-28),
+    ~67 MB/day, forever.
+
+    The balance search does not care about numbers at all. It asks the engine the
+    question we actually have -- "which invoices are fully paid?" -- and its
+    `balance` is computed in SQL (`invoiceBalanceQuery`: SUM(items) - SUM(successful
+    payments + refunds), zeroed for DRAFT/VOID/migrated/written-off), so it is
+    authoritative WITHOUT loading invoice items. That matters: the plain list
+    endpoints return shallow invoices and report balance 0.0 for an invoice that
+    genuinely owes money (verified live: a $59 invoice reported as 0.0) -- the
+    2026-09-18 false positive. Rationale in full on `_sweep_consider_invoice`.
+
+    Why not a "changed since" cursor
+    --------------------------------
+    Both alternatives were ruled out on evidence, not taste:
+      * `/accounts/{id}/invoices?startDate=...` filters `target_date`, a
+        service-period BUSINESS date that can be backdated -- so a late correction
+        written against an old period would never be seen again;
+      * the field-search form (`_q=1&created_date[gte]=...`) returns
+        `balance: null`, so it cannot decide paid/unpaid at all. `InvoiceJson`
+        exposes no `createdDate` either: an invoice's creation instant is simply
+        not observable through this API.
+
+    Self-healing by construction
+    ----------------------------
+    Every run re-reads the whole set from offset 0, so there is no watermark to
+    advance, none to corrupt, and a run interrupted half way loses nothing -- the
+    next run reads it all again. Termination uses the documented pagination
+    contract: keep paging while `X-Killbill-Pagination-NextOffset` is present.
+    """
     init_db()
     if not killbill_configured():
         # Inert-but-harmless: the timer is installed from day one and starts
@@ -1230,105 +1363,105 @@ def run_sweep(once: bool = False) -> int:
     conn = db()
     try:
         while True:
-            row = conn.execute(
-                "SELECT v FROM meta WHERE k='sweep_last_invoice_number'"
-            ).fetchone()
-            try:
-                # Stored as a string; accept the legacy float form too.
-                watermark = int(float(row["v"])) if row else 0
-            except (TypeError, ValueError):
-                watermark = 0
-
-            scanned = 0
+            examined = 0
             added = 0
-            highest = watermark
-            reached_end = False
-            stopped_at = 0
+            skipped_known = 0
+            pages = 0
+            offset = 0
+            highest = 0
+            total = None
+            capped = False
+            failed = ""
 
-            # Bug #151: walk FORWARD BY NUMBER from the watermark.
-            #
-            # The old code paged /1.0/kb/invoices/pagination from offset=0 with a
-            # cap of SWEEP_MAX_PAGES*100 = 2000 invoices. That endpoint returns
-            # invoices ASCENDING by invoiceNumber (verified live: offset 0 gave
-            # num=1 then num=2), so once a tenant passed 2000 invoices every run
-            # rescanned the same oldest 2000, `reached_end` stayed False, the
-            # watermark never advanced, and the NEW invoices were never examined
-            # again. Reconciliation died silently at exactly the volume where it
-            # starts to matter.
-            #
-            # byNumber also returns the FULL invoice including items, so `balance`
-            # and `amount` are authoritative here -- one call per invoice covers
-            # both the enumeration and the money fields the list endpoint cannot
-            # be trusted for.
-            #
-            # Because the walk is strictly contiguous and ascending, every invoice
-            # below `highest` has been fully considered, so advancing the watermark
-            # to it is safe even when a run stops early (per-run cap or a transient
-            # error). That is what makes this self-healing instead of self-blinding.
-            n = watermark + 1
-            probes = 0
-            misses = 0
-            while probes < SWEEP_MAX_INVOICES:
-                probes += 1
-                st, inv = http_json(
-                    "GET", f"{KILLBILL_URL}/1.0/kb/invoices/byNumber/{n}",
-                    None, killbill_headers(),
-                )
-                if st == 200 and isinstance(inv, dict):
-                    misses = 0
-                    scanned += 1
-                    highest = n
+            while pages < SWEEP_MAX_PAGES:
+                url = (f"{KILLBILL_URL}/1.0/kb/invoices/search/{SWEEP_BALANCE_QUERY}"
+                       f"?offset={offset}&limit={SWEEP_PAGE_SIZE}")
+                st, page, hdrs = http_json_hdrs("GET", url, None, killbill_headers())
+                if st != 200 or not isinstance(page, list):
+                    failed = f"http={st} {str(page)[:180]}"
+                    LOG.error(
+                        "sweep: balance search failed at offset=%s %s -- stopping",
+                        offset, failed,
+                    )
+                    break
+                pages += 1
+
+                if total is None:
+                    raw_total = hdrs.get("X-Killbill-Pagination-TotalNbRecords")
+                    try:
+                        total = int(raw_total) if raw_total is not None else None
+                    except (TypeError, ValueError):
+                        total = None
+
+                for inv in page:
+                    if not isinstance(inv, dict):
+                        continue
+                    examined += 1
+                    try:
+                        highest = max(highest, int(inv.get("invoiceNumber") or 0))
+                    except (TypeError, ValueError):
+                        pass
+
+                    inv_id = str(inv.get("invoiceId") or "")
+                    if inv_id and _sweep_already_recorded(conn, inv_id):
+                        skipped_known += 1
+                        continue
+
                     ok, why = _sweep_consider_invoice(conn, inv)
                     if ok:
                         added += 1
                         LOG.warning("sweep: %s", why)
-                    n += 1
-                    continue
 
-                # A number with no invoice. Verified live: HTTP 400 / code 4018
-                # "No invoice could be found for number N." Counted, not fatal --
-                # see SWEEP_MAX_GAPS for why a single gap must not end the walk.
-                if st == 400 and isinstance(inv, dict) and inv.get("code") == 4018:
-                    misses += 1
-                    if misses >= SWEEP_MAX_GAPS:
-                        reached_end = True
-                        break
-                    n += 1
-                    continue
+                nxt = hdrs.get("X-Killbill-Pagination-NextOffset")
+                if nxt is None:
+                    # Documented contract: the header is present ONLY when there
+                    # are further entries, so its absence is the end of the set.
+                    break
+                try:
+                    offset = int(nxt)
+                except (TypeError, ValueError):
+                    failed = f"unparseable NextOffset {nxt!r}"
+                    LOG.error("sweep: %s -- stopping", failed)
+                    break
+            else:
+                # Exited on the page counter rather than on NextOffset: we ran
+                # out of budget before the engine ran out of invoices.
+                capped = True
 
-                # Anything else is transient (network, 5xx, auth blip). Stop here.
-                # `highest` still covers everything already handled, so the next
-                # run resumes AT this invoice rather than skipping past it.
-                stopped_at = n
-                LOG.error(
-                    "sweep: byNumber/%s failed http=%s %s -- stopping at this invoice",
-                    n, st, str(inv)[:180],
-                )
-                break
-
-            if highest > watermark:
+            if highest:
+                # OBSERVABILITY ONLY. This is NOT a cursor -- nothing reads it
+                # back to decide where to resume (every run re-reads the set).
+                # Kept so operators can see the high-water mark at a glance, and
+                # so a rollback to the number walk has a sane starting point.
                 conn.execute(
                     "INSERT INTO meta(k,v) VALUES('sweep_last_invoice_number',?) "
                     "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
                     (str(highest),),
                 )
 
-            if reached_end:
-                LOG.info(
-                    "sweep complete: scanned=%s new=%s watermark %s -> %s",
-                    scanned, added, watermark, highest,
-                )
-            elif stopped_at:
+            if capped:
                 LOG.warning(
-                    "sweep stopped at invoice %s after scanning %s; watermark %s -> %s "
-                    "(resumes from there next run)",
-                    stopped_at, scanned, watermark, highest,
+                    "sweep INCOMPLETE: hit its page cap (%s pages x %s invoices = %s). "
+                    "examined=%s enqueued=%s skipped_known=%s set_size=%s. Coverage was "
+                    "NOT complete -- raise KB_SWEEP_MAX_PAGES.",
+                    SWEEP_MAX_PAGES, SWEEP_PAGE_SIZE,
+                    SWEEP_MAX_PAGES * SWEEP_PAGE_SIZE,
+                    examined, added, skipped_known,
+                    total if total is not None else "unknown",
+                )
+            elif failed:
+                LOG.warning(
+                    "sweep stopped early after %s page(s): %s. examined=%s enqueued=%s "
+                    "skipped_known=%s -- nothing was recorded as complete, so the next "
+                    "run re-reads the whole set",
+                    pages, failed, examined, added, skipped_known,
                 )
             else:
-                LOG.warning(
-                    "sweep hit its per-run cap of %s invoices; watermark %s -> %s "
-                    "(resumes from there next run)",
-                    SWEEP_MAX_INVOICES, watermark, highest,
+                LOG.info(
+                    "sweep complete: pages=%s examined=%s enqueued=%s skipped_known=%s "
+                    "set_size=%s highest_invoice_number=%s",
+                    pages, examined, added, skipped_known,
+                    total if total is not None else "unknown", highest,
                 )
 
             if once:
@@ -1355,7 +1488,8 @@ def run_status() -> int:
               f"  prefixed={LITELLM_KEY.startswith('sk-')}")
         print(f"verify        : {VERIFY}  killbill_configured={killbill_configured()}")
         print(f"worker lease  : {LEASE_SECONDS}s  owner={WORKER_OWNER}  reap_batch={REAP_BATCH}")
-        print(f"sweep scope   : from watermark forward, max {SWEEP_MAX_INVOICES} invoices/run")
+        print(f"sweep scope   : balance search (balance<=0), max {SWEEP_MAX_PAGES} pages "
+              f"x {SWEEP_PAGE_SIZE} invoices/run")
         print()
         print("events by status:")
         for r in conn.execute(

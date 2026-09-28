@@ -322,14 +322,14 @@ def main():
         # to start. Worse: a blank KB_VERIFY= evaluated to False, silently turning
         # fail-closed verification into fail-open.
         text = open(ENVF, encoding="utf-8").read()
-        text += "\nKB_LEASE_SECONDS=\nKB_VERIFY=\nKB_SWEEP_MAX_INVOICES=\n"
+        text += "\nKB_LEASE_SECONDS=\nKB_VERIFY=\nKB_SWEEP_PAGE_SIZE=\n"
         open(ENVF, "w", encoding="utf-8").write(text)
         os.chmod(ENVF, 0o600)
         r = subprocess.run(
             ["python3", "-c",
              f"import sys; sys.path.insert(0, {BASE!r}); import kb_bridge as k; "
              "print('LEASE', k.LEASE_SECONDS); print('VERIFY', k.VERIFY); "
-             "print('MAXINV', k.SWEEP_MAX_INVOICES)"],
+             "print('PAGESZ', k.SWEEP_PAGE_SIZE)"],
             capture_output=True, text=True)
         out = (r.stdout + r.stderr).strip()
         print("  import output: " + out.replace("\n", " | ")[:190])
@@ -346,8 +346,8 @@ def main():
               "LEASE 600.0" in out, _pick("LEASE"))
         check("blank KB_VERIFY stays TRUE (fail-closed NOT downgraded)",
               "VERIFY True" in out, _pick("VERIFY"))
-        check("blank KB_SWEEP_MAX_INVOICES falls back to 200", "MAXINV 200" in out, _pick("MAXINV"))
-        env_write({"KB_LEASE_SECONDS": "", "KB_VERIFY": "", "KB_SWEEP_MAX_INVOICES": ""})
+        check("blank KB_SWEEP_PAGE_SIZE falls back to 200", "PAGESZ 200" in out, _pick("PAGESZ"))
+        env_write({"KB_LEASE_SECONDS": "", "KB_VERIFY": "", "KB_SWEEP_PAGE_SIZE": ""})
 
     finally:
         print()
