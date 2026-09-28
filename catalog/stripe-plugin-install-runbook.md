@@ -263,20 +263,40 @@ Then: `cd /opt/killbill && sudo docker compose up -d killbill`
    ✅ **PASSED on `.104` 2026-09-28** with `docker compose up -d --force-recreate killbill`: the plugin
    re-registered itself in both registries and emitted `BundleEvent STARTED` again.
 
-### Step 4b — ⚠️ THE HEALTHCHECK DOES **NOT** PROVE THE KEY WORKS
-Verified 2026-09-28: the plugin reports **`{"message":"Stripe OK"}` with no tenant plugin config
-present at all** (no `stripe_*` config in the DB, no `STRIPE_API_KEY` in the environment). So a green
-healthcheck is evidence that the **bundle loaded**, never that the **key resolved**. The only real proof
-of the key is an actual Stripe API call (create a payment method / open a Checkout session). Do not
-report "Stripe is configured" on the strength of the healthcheck.
+### Step 4b — ⚠️ WHAT THE HEALTHCHECK DOES AND DOES NOT PROVE (falsification-tested 2026-09-28)
+Three states, all measured on `.104`:
+
+| Call | Result |
+|---|---|
+| `GET /plugins/killbill-stripe/healthcheck` with **no tenant headers** | **200 `{"message":"Stripe OK"}`** — meaningless: it says OK with no config present at all |
+| … **with tenant auth**, no plugin config uploaded | **503 `Stripe error: No API key provided`** — detects the *absence* of config |
+| … **with tenant auth**, a **deliberately invalid** api key | **200 `{"message":"Stripe OK"}`** — does **not** detect a bad key (re-tested after a 10 s wait, so this is not a cache) |
+
+**Conclusion: the healthcheck answers "is a key configured?", never "does the key work?"**
+`StripeHealthcheck.pingStripe()` builds `RequestOptions`; Stripe's SDK throws "No API key provided"
+for a null/blank key, but an authentication *failure* is never surfaced. **A green healthcheck must
+never be reported as "Stripe is working."**
+
+The only proof a key works is a real Stripe API call — verified independently on 2026-09-28 by calling
+`GET https://api.stripe.com/v1/balance` and `/v1/account` directly with the key (200, `livemode: true`,
+`acct_1TkRw5BSBjZGow5B`, charges enabled).
 
 ### Step 5 — Tenant config
 `POST /1.0/kb/tenants/uploadPluginConfig/killbill-stripe` with
 `org.killbill.billing.plugin.stripe.apiKey=${env:STRIPE_API_KEY}`
 
-⚠️ **CORRECTED:** this file previously said "a working healthcheck implies the env var resolved". **It
-does not** — see Step 4b: the healthcheck passes with *no* config present at all. Only a real Stripe API
-call proves the key.
+⚠️ **UPLOAD THE BODY WITH NO TRAILING NEWLINE.** `StripeConfigPropertyResolver`'s env pattern is
+**anchored** (`^\$\{env:([^}]+)}$`). A body ending in `\n` stores the value as
+`${env:STRIPE_API_KEY}\n`; the pattern does not match, the key is never resolved, and the plugin
+reports **503** with no other clue. Measured 2026-09-28: **64 bytes → 503, 63 bytes → 200.**
+Use `printf '%s'` (not `echo`, not a heredoc).
+
+**Verified live 2026-09-28:** the config is stored as `tenant_kvs.tenant_key = PLUGIN_CONFIG_killbill-stripe`;
+the secret itself never enters the database. The key is supplied out-of-band:
+
+1. `printf 'STRIPE_API_KEY=<key>' > /opt/killbill/.env` (mode 600, root)
+2. one line in `docker-compose.yml`: `STRIPE_API_KEY: ${STRIPE_API_KEY}`
+3. `docker compose up -d killbill` — the container then carries `STRIPE_API_KEY` (verified: len 107, `rk_live_`)
 
 **The complete set of keys the plugin reads** (extracted from the 8.0.4 jar, verified 2026-09-28):
 
@@ -296,6 +316,10 @@ when creating a payment method.
 
 ### Step 6 — Prove it with real money, in order
 1. `POST /plugins/killbill-stripe/checkout?kbAccountId=<id>&successUrl=…&cancelUrl=…`
+   ⚠️ **NOT YET WORKING (2026-09-28):** with `kbAccountId` + `kbInvoiceId` + `successUrl` + `cancelUrl`
+   this returns **400 `java.lang.NullPointerException`**. The servlet reads `kbAccountId`/`kb_account_id`,
+   `kbInvoiceId`/`kb_invoice_id`, `successUrl`/`success_url`, `cancelUrl`/`cancel_url`. Needs investigation
+   before the checkout flow can be exercised — do not assume the parameter set above is complete.
 2. **Open the returned URL in a real browser** — confirm the hosted page renders
 3. Card entry runs in **`mode: "setup"` → ⚠️ charges $0.** Save the card; confirm it appears in Kill Bill
 4. Registering the card needs **`addPaymentMethod?pluginProperty=sessionId=cs_…`** or `PUT /accounts/{id}/paymentMethods/refresh` — *which of these Kaui does for us is UNVERIFIED*
