@@ -88,6 +88,15 @@ The live keys' `2026-10-01` reset is therefore backed by a **proven mechanism** 
 
 Both: `shellcheck -S warning` clean, `bash -n` clean.
 
+`verify-budget-reset.sh` was then run for real and reported:
+
+```
+[t+510s] spend=0  reset_at=2026-09-28 23:04:00
+RESULT: PASS — the budget-reset job is live and clears spend.
+cleanup (EXIT trap): /key/delete -> http 200
+keys remaining: <null> 1mo | admin 1mo | cust-demo-001 NULL (inherits, correct) | custodian 1mo
+```
+
 > **The first version of `fix-orphan-budget-durations.sh` had a real bug.** `--clear` re-derived
 > its targets from the orphan query, which matches nothing after `--apply` — so it silently did
 > nothing. Running the script is what caught it; reading it did not.
