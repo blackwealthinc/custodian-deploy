@@ -646,7 +646,16 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
     bursts were being refused at the TCP backlog before our own logic ever ran.
     """
 
-    daemon_threads = True
+    # Bug #158: this MUST be False. With daemon_threads=True, socketserver's
+    # _Threads.append() returns early for daemon threads, so a handler thread is
+    # never tracked and server_close()'s join is a no-op -- an in-flight Kill
+    # Bill webhook would be abandoned mid-request, and Kill Bill does NOT retry a
+    # callback it never got a response from. False makes server_close() join
+    # every handler, so a stop drains in-flight events before exiting.
+    # Safe against a hung peer: Handler._send() always sends "Connection: close",
+    # and the receiver handler is a fast SQLite write (no outbound HTTP).
+    daemon_threads = False
+    block_on_close = True
     request_queue_size = 128
 
     def process_request(self, request, client_address):
@@ -771,18 +780,35 @@ def run_receiver() -> int:
     global _READY
     init_db()
 
+    if not PATH_TOKEN:
+        LOG.warning("KB_PATH_TOKEN is empty -- receiver will reject everything (fail-closed)")
+
+    # Create the server BEFORE registering signals so _stop can never observe an
+    # unbound `httpd`.
+    httpd = BoundedThreadingHTTPServer((BIND, PORT), Handler)
+
     def _stop(signum, _frame):
         global _READY
         LOG.info("signal %s -- shutting down receiver", signum)
         _READY = False
+        # Bug #158: serve_forever() runs on THIS thread. Calling
+        # httpd.shutdown() directly here would deadlock -- the CPython docs are
+        # explicit:
+        #   "shutdown() must be called while serve_forever() is running in a
+        #    different thread otherwise it will deadlock."
+        # (_BaseServer__is_shut_down is only set by serve_forever's finally
+        # block, which cannot run while this handler occupies this thread.)
+        # Before this fix nothing called shutdown() at all, so serve_forever()
+        # never returned, server_close() never ran, and the process always burned
+        # the full TimeoutStopSec and died by SIGKILL.
+        # Hand the call to a helper thread; it returns as soon as serve_forever()
+        # exits, bounded by poll_interval.
+        threading.Thread(
+            target=httpd.shutdown, daemon=True, name="httpd-shutdown"
+        ).start()
 
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
-
-    if not PATH_TOKEN:
-        LOG.warning("KB_PATH_TOKEN is empty -- receiver will reject everything (fail-closed)")
-
-    httpd = BoundedThreadingHTTPServer((BIND, PORT), Handler)
     LOG.info(
         "receiver listening on %s:%s  path=/kb/events/<token>  db=%s  "
         "max_concurrent=%s  backlog=%s",
