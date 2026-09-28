@@ -270,9 +270,14 @@ Three states, all measured on `.104`:
 |---|---|
 | `GET /plugins/killbill-stripe/healthcheck` with **no tenant headers** | **200 `{"message":"Stripe OK"}`** — meaningless: it says OK with no config present at all |
 | … **with tenant auth**, no plugin config uploaded | **503 `Stripe error: No API key provided`** — detects the *absence* of config |
-| … **with tenant auth**, a **deliberately invalid** api key | **200 `{"message":"Stripe OK"}`** — does **not** detect a bad key (re-tested after a 10 s wait, so this is not a cache) |
+| … **with tenant auth**, a **deliberately invalid** api key | **200 `{"message":"Stripe OK"}`** — does **not** detect a bad key. Re-tested after a **full JVM restart** with the garbage key as the only active config row (so a stale cache cannot explain it) and it was still 200 |
 
 **Conclusion: the healthcheck answers "is a key configured?", never "does the key work?"**
+
+⚠️ **`uploadPluginConfig` changes are CACHED — do not judge a config change from a check seconds later.**
+Measured 2026-09-28: a correct upload was still reporting 503 at **+4 s**, and an earlier change became visible
+within **40 s**. **Restart `killbill` after changing plugin config** to apply it deterministically. A 503 seen
+immediately after an upload means "not picked up yet", not "the config is wrong".
 `StripeHealthcheck.pingStripe()` builds `RequestOptions`; Stripe's SDK throws "No API key provided"
 for a null/blank key, but an authentication *failure* is never surfaced. **A green healthcheck must
 never be reported as "Stripe is working."**
