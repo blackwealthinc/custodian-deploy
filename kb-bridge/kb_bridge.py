@@ -236,6 +236,11 @@ CREATE TABLE IF NOT EXISTS accounts (
     account_id TEXT PRIMARY KEY,
     budget_id  TEXT,
     key_alias  TEXT,
+    -- sha256 hex of the customer's LiteLLM key (LiteLLM's hash_token). Needed to
+    -- reset a key's accrued spend on payment (Bug #156 follow-up): LiteLLM has
+    -- no way to look a key up by budget_id or alias, so we must store it.
+    -- NEVER store the plaintext key here.
+    litellm_key_hash TEXT,
     plan       TEXT,
     active     INTEGER NOT NULL DEFAULT 1,
     note       TEXT,
@@ -311,6 +316,12 @@ def init_db(seed: bool = True) -> None:
     conn = db()
     try:
         conn.executescript(SCHEMA)
+        # CREATE TABLE IF NOT EXISTS does NOT add columns to a table that already
+        # exists, so new columns need an explicit idempotent ALTER here.
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(accounts)")}
+        if "litellm_key_hash" not in cols:
+            conn.execute("ALTER TABLE accounts ADD COLUMN litellm_key_hash TEXT")
+            LOG.info("migrated accounts: added litellm_key_hash")
         if seed:
             now = time.time()
             defaults = [("basic", 5.0, 0.0), ("pro", 20.0, 0.0), ("business", 100.0, 0.0)]
@@ -373,6 +384,37 @@ def litellm_set_budget(budget_id: str, max_budget: float) -> tuple[bool, str]:
         return True, f"created budget_id={budget_id} max_budget={max_budget}"
 
     return False, f"budget/update http={status} {str(resp)[:160]}; budget/new http={status2} {str(resp2)[:160]}"
+
+
+def litellm_reset_spend(key_ref: str, reset_to: float = 0.0) -> tuple[bool, str]:
+    """Clear a customer key's accrued spend so a payment actually unblocks them.
+
+    Bug #156 follow-up. `max_budget` is a CEILING, not an allowance: LiteLLM
+    blocks on `spend >= max_budget`, and /budget/update accepts no `spend` field
+    at all (verified in v1.95.0), so raising the ceiling can never empty the
+    meter. A customer who burned their allowance, got cut off and then PAID
+    therefore stayed blocked until the monthly reset.
+
+    This is the endpoint that does empty it. Verified live against v1.95.0:
+      POST /key/{key}/reset_spend {"reset_to": 0}
+      -> 200 {"spend": 0.0, "previous_spend": 0.42, "max_budget": 1.0, ...}
+    It also rewrites the proxy's spend counter cache, so the change takes effect
+    immediately rather than on the next counter refresh.
+
+    key_ref is either the plaintext `sk-...` key or its sha256 hex (LiteLLM's
+    `hash_token`). We store the hash, so the plaintext key is never needed here.
+    `reset_to` must be >= 0 and <= the current spend, so 0.0 is always safe and
+    the call is idempotent.
+    """
+    status, resp = http_json(
+        "POST", f"{LITELLM_URL}/key/{key_ref}/reset_spend",
+        {"reset_to": reset_to}, litellm_headers(),
+    )
+    if status == 200 and isinstance(resp, dict):
+        return True, (
+            f"spend reset {resp.get('previous_spend')} -> {resp.get('spend')}"
+        )
+    return False, f"key/reset_spend http={status} {str(resp)[:200]}"
 
 
 def killbill_headers() -> dict:
@@ -623,7 +665,31 @@ def process_event(conn: sqlite3.Connection, row: sqlite3.Row) -> tuple[str, str]
             return "failed", f"no plan row for plan={plan!r} (account {account_id})"
         amount = float(prow["max_budget"])
         ok, msg = litellm_set_budget(budget_id, amount)
-        return ("done" if ok else "failed"), msg
+
+        # Bug #156 follow-up: raising the ceiling is NOT enough. LiteLLM blocks on
+        # `spend >= max_budget`, and /budget/update has no `spend` field, so a
+        # customer who burned their allowance, got cut off and then PAID kept the
+        # full meter and stayed blocked until the monthly reset. The locked
+        # decision is "money in -> tokens available immediately", so clear the
+        # accrued spend as well. reset_to=0 is safe (0 <= spend) and idempotent,
+        # so a retried event is harmless.
+        key_hash = (acct["litellm_key_hash"] or "").strip()
+        if not key_hash:
+            # Do not fail the event: retrying cannot conjure a hash. Set the
+            # ceiling, say loudly what was skipped, and carry on -- but make it
+            # visible in the event reason so it is never a silent degradation.
+            LOG.warning(
+                "account %s has no litellm_key_hash -- ceiling set but accrued spend "
+                "NOT reset; run: kb_bridge.py map --account-id %s --budget-id %s "
+                "--plan %s --key-hash <key|hash>",
+                account_id, account_id, budget_id, plan,
+            )
+            return ("done" if ok else "failed"), (
+                f"{msg}; SPEND NOT RESET (no litellm_key_hash for account {account_id})"
+            )
+
+        ok2, msg2 = litellm_reset_spend(key_hash)
+        return ("done" if (ok and ok2) else "failed"), f"{msg}; {msg2}"
 
     # cancellation
     prow = conn.execute("SELECT * FROM plans WHERE plan_name=?", (acct["plan"],)).fetchone()
@@ -1335,21 +1401,49 @@ def run_status() -> int:
         conn.close()
 
 
+def normalise_key_hash(value: str) -> str:
+    """Accept either a plaintext LiteLLM key or its sha256 hash; never store plaintext.
+
+    LiteLLM's `hash_token` is plain sha256 hex (verified live: our locally
+    computed sha256 matched the `key_hash` the proxy returned). Returns "" for
+    anything that is neither, so a typo can never be written to the DB.
+    """
+    v = (value or "").strip()
+    if not v:
+        return ""
+    if len(v) == 64 and all(c in "0123456789abcdef" for c in v.lower()):
+        return v.lower()
+    if v.startswith("sk-"):
+        return hashlib.sha256(v.encode()).hexdigest()
+    return ""
+
+
 def run_map(args) -> int:
     init_db()
+    key_hash = normalise_key_hash(args.key_hash)
+    if args.key_hash and not key_hash:
+        print(f"refusing --key-hash {args.key_hash[:6]}...: expected an sk-... key "
+              f"or a 64-char sha256 hex", file=sys.stderr)
+        return 2
     conn = db()
     try:
         conn.execute(
-            "INSERT INTO accounts(account_id,budget_id,key_alias,plan,active,note,updated_at)"
-            " VALUES(?,?,?,?,?,?,?)"
+            "INSERT INTO accounts(account_id,budget_id,key_alias,litellm_key_hash,"
+            " plan,active,note,updated_at)"
+            " VALUES(?,?,?,?,?,?,?,?)"
             " ON CONFLICT(account_id) DO UPDATE SET budget_id=excluded.budget_id,"
-            " key_alias=excluded.key_alias, plan=excluded.plan, active=excluded.active,"
+            " key_alias=excluded.key_alias,"
+            # never blank an existing hash just because this call omitted it
+            " litellm_key_hash=COALESCE(NULLIF(excluded.litellm_key_hash,''),"
+            "                          accounts.litellm_key_hash),"
+            " plan=excluded.plan, active=excluded.active,"
             " note=excluded.note, updated_at=excluded.updated_at",
-            (args.account_id, args.budget_id, args.key_alias, args.plan,
+            (args.account_id, args.budget_id, args.key_alias, key_hash, args.plan,
              0 if args.disable else 1, args.note, time.time()),
         )
         print(f"mapped account {args.account_id} -> budget {args.budget_id} "
-              f"plan={args.plan} active={not args.disable}")
+              f"plan={args.plan} active={not args.disable} "
+              f"key_hash={'set' if key_hash else 'not set'}")
         return 0
     finally:
         conn.close()
@@ -1394,6 +1488,10 @@ def main() -> int:
     m.add_argument("--budget-id", required=True)
     m.add_argument("--plan", default="basic")
     m.add_argument("--key-alias", default="")
+    m.add_argument("--key-hash", default="",
+                   help="customer LiteLLM key (sk-...) or its sha256 hash. Required for "
+                        "spend to be reset when they pay; the plaintext key is hashed "
+                        "and never stored.")
     m.add_argument("--note", default="")
     m.add_argument("--disable", action="store_true")
 
