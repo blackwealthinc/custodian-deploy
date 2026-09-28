@@ -184,6 +184,19 @@ MAX_CONCURRENT = int(cfg("KB_MAX_CONCURRENT", "32"))
 RECV_SLOT_WAIT_SECONDS = float(cfg("KB_RECV_SLOT_WAIT_SECONDS", "0.15"))
 _SLOTS = threading.BoundedSemaphore(MAX_CONCURRENT)
 
+# Per-connection socket timeout. WITHOUT this, a peer that promises a
+# Content-Length and then stalls holds its handler thread forever: the handler
+# blocks in rfile.read(), server_close() joins it forever, the unit hits
+# TimeoutStopSec and systemd SIGKILLs us -- the exact symptom of Bug #158, back
+# again. It also stops one stalled connection from sitting on a concurrency slot
+# indefinitely. Handlers here take single-digit milliseconds, so 5 s is generous.
+RECV_SOCKET_TIMEOUT_SECONDS = float(cfg("KB_RECV_SOCKET_TIMEOUT_SECONDS", "5"))
+# Hard ceiling on the post-signal drain. server_close() joins in-flight handlers
+# with no timeout of its own, and a client that dribbles one byte at a time can
+# outlive any per-read timeout, so the drain also needs an absolute deadline.
+# MUST stay comfortably below the unit's TimeoutStopSec (10 s).
+DRAIN_BUDGET_SECONDS = float(cfg("KB_DRAIN_BUDGET_SECONDS", "3"))
+
 # Event types we act on. Anything else is acknowledged and marked 'skipped'.
 ACTION_PAYMENT = "INVOICE_PAYMENT_SUCCESS"
 ACTION_CANCEL = ("SUBSCRIPTION_CANCEL", "SUBSCRIPTION_EXPIRED")
@@ -699,6 +712,9 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
 class Handler(BaseHTTPRequestHandler):
     server_version = "kb-bridge"
     protocol_version = "HTTP/1.1"
+    # Bounds a stalled peer so it cannot wedge the shutdown drain, and so it
+    # cannot hold a concurrency slot forever. See RECV_SOCKET_TIMEOUT_SECONDS.
+    timeout = RECV_SOCKET_TIMEOUT_SECONDS
 
     def log_message(self, fmt, *args):  # noqa: A003 - stdlib signature
         LOG.debug("%s - %s", self.address_string(), fmt % args)
@@ -817,8 +833,27 @@ def run_receiver() -> int:
     try:
         httpd.serve_forever(poll_interval=0.5)
     finally:
+        # Bug #158 follow-up: bound the drain. server_close() joins every
+        # in-flight handler with no timeout of its own, so one peer that stalls
+        # (or dribbles bytes forever) would hold the join open, we would hit
+        # TimeoutStopSec, and systemd would SIGKILL us -- the very symptom this
+        # change exists to remove. Arm an absolute deadline before joining.
+        threading.Thread(
+            target=_force_exit_after, args=(DRAIN_BUDGET_SECONDS,),
+            daemon=True, name="drain-deadline",
+        ).start()
         httpd.server_close()
     return 0
+
+
+def _force_exit_after(seconds: float) -> None:
+    """Absolute ceiling on the shutdown drain. See run_receiver."""
+    time.sleep(seconds)
+    LOG.warning(
+        "drain budget of %ss exceeded -- abandoning in-flight handlers", seconds
+    )
+    logging.shutdown()
+    os._exit(0)
 
 
 # --------------------------------------------------------------------------- #
