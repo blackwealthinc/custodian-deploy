@@ -64,6 +64,8 @@ PORT=8602 WEBUI_PORT=3002 CUSTOMER_ID=john \
 | `setup-budget-proxy.sh` | Deploy LiteLLM AI Gateway |
 | `setup-custodian-factory.sh` | Deploy Hermes + Open WebUI |
 | `docker-compose.custodian-factory.yml` | Compose file for customer servers |
+| `fix-orphan-budget-durations.sh` | Repair LiteLLM keys whose budget never resets (dry-run / `--apply` / `--clear --only`) |
+| `verify-budget-reset.sh` | Prove the LiteLLM budget-reset job actually fires (~10 min, disposable key) |
 
 ## Docs
 
