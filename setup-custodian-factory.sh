@@ -36,7 +36,7 @@ if [ -z "${!_CAK_VN:-}" ]; then
   KEY_RESPONSE=$(curl -s -X POST "${BUDGET_PROXY_URL%/v1}/key/generate" \
     -H "Authorization: Bearer ${!_LMK_VN}" \
     -H "Content-Type: application/json" \
-    -d "{\"key_alias\": \"${CUSTOMER_ID:-custodian}\", \"models\": [\"deepseek-v4-pro\", \"dashscope-vision\", \"gpt-image-2-hd\"], \"max_budget\": ${MAX_BUDGET:-100}, \"budget_duration\": \"1mo\"}" 2>/dev/null)
+    -d "{\"key_alias\": \"${CUSTOMER_ID:-custodian}\", \"models\": [\"deepseek-v4-pro\", \"dashscope-vision\", \"gpt-image-2\"], \"max_budget\": ${MAX_BUDGET:-100}, \"budget_duration\": \"1mo\"}" 2>/dev/null)
   _RAW_KEY=$(echo "$KEY_RESPONSE" | grep -o '"key":"[^"]*"' | head -1 | cut -d'"' -f4)
   if [ -z "${_RAW_KEY}" ]; then
     echo "ERROR: Failed to auto-generate API key. Response:"
@@ -658,7 +658,7 @@ def upsert_model(model_id, name, active, base=None):
     )
 
 upsert_model('dashscope-vision', 'Custodian Vision', 1)
-for m in ('deepseek-chat', 'deepseek-v4-flash', 'deepseek-v4-pro', 'gpt-image-2-hd', 'custodian-video'):
+for m in ('deepseek-chat', 'deepseek-v4-flash', 'deepseek-v4-pro', 'gpt-image-2', 'custodian-video'):
     upsert_model(m, m, 0)
 # hide any legacy derived "Custodian" (UUID, base=hermes-backend) from older deploys,
 # to avoid a duplicate next to the renamed base
@@ -813,7 +813,10 @@ conn.execute("UPDATE config SET value=? WHERE key=?",
 conn.execute("UPDATE config SET value=? WHERE key=?",
     (json.dumps("openai"), "image_generation.engine"))
 conn.execute("UPDATE config SET value=? WHERE key=?",
-    (json.dumps("gpt-image-2-hd"), "image_generation.model"))
+    (json.dumps("gpt-image-2"), "image_generation.model"))
+# ^ NOTE: inert on current deploys. OWUI runs with ENABLE_PERSISTENT_CONFIG=false,
+#   so the DB value is IGNORED and the compose env IMAGE_GENERATION_MODEL wins.
+#   Written anyway so a future ENABLE_PERSISTENT_CONFIG=true deploy is not wrong.
 conn.execute("UPDATE config SET value=? WHERE key=?",
     (json.dumps("1024x1024"), "image_generation.size"))
 conn.execute("UPDATE config SET value=? WHERE key=?",

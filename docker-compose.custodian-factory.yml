@@ -76,10 +76,13 @@ services:
       - ENABLE_WEB_SEARCH=true
       - WEB_SEARCH_ENGINE=searxng
       - SEARXNG_QUERY_URL=http://searxng:8080/search?q=<query>
-      # Image generation — DALL-E HD via LiteLLM budget proxy
+      # Image generation — standard quality via LiteLLM budget proxy (no HD tier)
       - ENABLE_IMAGE_GENERATION=true
       - IMAGE_GENERATION_ENGINE=openai
-      - IMAGE_GENERATION_MODEL=gpt-image-2-hd
+      # NOTE: this env var is AUTHORITATIVE over the DB — OWUI runs with
+      # ENABLE_PERSISTENT_CONFIG=false, so `image_generation.model` in the DB is
+      # ignored and this value wins. Keep it in step with the LiteLLM model_list.
+      - IMAGE_GENERATION_MODEL=gpt-image-2
       - IMAGE_SIZE=1024x1024
       - IMAGES_OPENAI_API_BASE_URL=${BUDGET_PROXY_URL:-http://100.64.0.1:4000/v1}
       - IMAGES_OPENAI_API_KEY=${CUSTOMER_API_KEY}
