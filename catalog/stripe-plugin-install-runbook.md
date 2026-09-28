@@ -298,6 +298,12 @@ the secret itself never enters the database. The key is supplied out-of-band:
 2. one line in `docker-compose.yml`: `STRIPE_API_KEY: ${STRIPE_API_KEY}`
 3. `docker compose up -d killbill` — the container then carries `STRIPE_API_KEY` (verified: len 107, `rk_live_`)
 
+ℹ️ **Re-uploading does NOT overwrite — it inserts and deactivates.** Each `uploadPluginConfig` call adds a new
+`tenant_kvs` row and sets `is_active=0` on the previous ones, so the table accumulates history and exactly one
+row is ever active (verified: 6 uploads → 6 rows, 1 active). That is correct behaviour, not a leak — but it
+means **do not panic at a multi-row count; check `is_active`.** (Same shape as the two `CATALOG` rows, where KB
+instead *merges* all active rows — different mechanism, so check the specific key.)
+
 **The complete set of keys the plugin reads** (extracted from the 8.0.4 jar, verified 2026-09-28):
 
 | Key (`org.killbill.billing.plugin.stripe.` + …) | Purpose |
