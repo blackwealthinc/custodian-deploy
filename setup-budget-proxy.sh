@@ -177,18 +177,36 @@ general_settings:
   disable_spend_logs: false
 
 model_list:
+  # COST RATES ARE PINNED EXPLICITLY (Phase 1, 2026-09-28).
+  # Why: without explicit cost fields LiteLLM resolves each model's price from its
+  # remote price map (model_prices_and_context_window.json), which it fetches from
+  # GitHub at startup. That map has drifted, and our `deepseek-v4-pro` alias once
+  # resolved to *Tencent's hosted-DeepSeek* entry ($0.435/M in, $0.87/M out)
+  # instead of DeepSeek's own ($1.32/M in, $3.96/M out) - under-metering our real
+  # cost by ~3x. Pinning bypasses the lookup entirely.
+  # Values below = DeepSeek official rate card, PEAK column (conservative: never
+  # under-charges). Source: https://api-docs.deepseek.com/quick_start/pricing
   - model_name: deepseek-chat
     litellm_params:
       model: deepseek/deepseek-v4-pro
       api_key: ${DEEPSEEK_API_KEY}
+      input_cost_per_token: 1.32e-06
+      output_cost_per_token: 3.96e-06
+      cache_read_input_token_cost: 4.4e-08
   - model_name: deepseek-v4-pro
     litellm_params:
       model: deepseek/deepseek-v4-pro
       api_key: ${DEEPSEEK_API_KEY}
+      input_cost_per_token: 1.32e-06
+      output_cost_per_token: 3.96e-06
+      cache_read_input_token_cost: 4.4e-08
   - model_name: deepseek-v4-flash
     litellm_params:
       model: deepseek/deepseek-v4-flash
       api_key: ${DEEPSEEK_API_KEY}
+      input_cost_per_token: 3.0e-07
+      output_cost_per_token: 1.2e-06
+      cache_read_input_token_cost: 6.0e-09
   - model_name: dashscope-vision
     litellm_params:
       model: openai/qwen-vl-max
@@ -196,10 +214,17 @@ model_list:
       api_key: ${!_DSK_VN}
       input_cost_per_token: 0.0000008
       output_cost_per_token: 0.0000032
-  - model_name: gpt-image-2-hd
+  # Renamed from gpt-image-2-hd (Phase 1, 2026-09-28): the model is standard
+  # quality - there is no HD tier - so the "-hd" suffix was a false claim.
+  # Rates = OpenAI published GPT Image 2 token rates (verified against our own
+  # spend logs: 2447*5e-06 + 2744*3e-05 = 0.094685, matching exactly).
+  - model_name: gpt-image-2
     litellm_params:
       model: openai/gpt-image-2
       api_key: ${!_OAI_VN}
+      input_cost_per_token: 5.0e-06
+      output_cost_per_token: 3.0e-05
+      cache_read_input_token_cost: 1.25e-06
 
 litellm_settings:
   drop_params: true
@@ -281,7 +306,7 @@ ADMIN_KEY_RESPONSE=$(curl -s -X POST http://localhost:4000/key/generate \
     "key_alias": "admin-key",
     "max_budget": 0,
     "budget_duration": "1mo",
-    "models": ["deepseek-chat", "deepseek-v4-pro", "deepseek-v4-flash", "dashscope-vision", "gpt-image-2-hd"],
+    "models": ["deepseek-chat", "deepseek-v4-pro", "deepseek-v4-flash", "dashscope-vision", "gpt-image-2"],
     "metadata": {"user": "admin", "email": "'"${ADMIN_EMAIL}"'"}
   }' 2>/dev/null)
 

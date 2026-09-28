@@ -50,6 +50,11 @@ cfg["model_list"].append({
         # "gemini/veo-3.1-generate-preview" (Standard) for production output.
         "model": "gemini/veo-3.1-lite-generate-preview",
         "api_key": os.environ["GEMINI_API_KEY"],
+        # Pinned (Phase 1, 2026-09-28). Without this, LiteLLM resolves the video
+        # price from its remote price map at startup. Pinned to the map's own
+        # veo-3.1-lite value, which our spend logs confirm: 24 generations cost
+        # exactly $4.80 = $0.20 each = 4 seconds x $0.05/sec.
+        "output_cost_per_second": 5.0e-02,
     },
 })
 with open(path, "w") as f:
