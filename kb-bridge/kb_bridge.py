@@ -1159,9 +1159,15 @@ def process_event(conn: sqlite3.Connection, row: sqlite3.Row) -> tuple[str, str]
         if not pok:
             return "failed", f"cannot resolve the payment's plugin: {pname}"
         if pname == BOOKKEEPING_PLUGIN and rail != "manual":
+            # "failed" is retried with backoff (see the worker), which is
+            # deliberate: an operator who CORRECTS a mis-set rail should have the
+            # real payments heal. Say that in the reason, so nobody flips a rail
+            # without knowing it will credit these retroactively.
             return "failed", (
                 f"refusing a {pname} payment (rail={rail}, payment {pay_id}): "
-                "bookkeeping payments prove no money arrived"
+                "bookkeeping payments prove no money arrived. Retried with backoff; "
+                "set this account to rail=manual ONLY if recorded payments really are "
+                "this account's confirmation, because doing so will credit them"
             )
 
         if is_topup:
