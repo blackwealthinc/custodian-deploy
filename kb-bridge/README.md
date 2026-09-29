@@ -101,13 +101,89 @@ curl -X POST "http://192.168.50.104:8080/1.0/kb/tenants/registerNotificationCall
 
 | Event | Action |
 |---|---|
-| `INVOICE_PAYMENT_SUCCESS` | verify the invoice, then set the budget to `plans.max_budget` |
+| `INVOICE_PAYMENT_SUCCESS` | verify the invoice, then **classify** it: a top-up raises the ceiling by `paid ÷ 1.15`; a subscription payment sets it to `plan + unconsumed top-up` and clears spend |
 | `SUBSCRIPTION_CANCEL`, `SUBSCRIPTION_EXPIRED` | set the budget to `plans.on_cancel_budget` (default `0.0`) |
 | `SUBSCRIPTION_CHANGE` | **skipped with an explicit reason** — see *Known gaps* |
 | anything else | acknowledged, marked `skipped` — not an error |
 | unknown account | `skipped` with `no active mapping` — not an error |
 
 Retries use exponential backoff (15 s → 15 min) up to `KB_MAX_ATTEMPTS`, then park as `failed` with the reason in `last_error`.
+
+## Top-ups (Phase 2)
+
+A top-up is a **one-time** charge that raises a customer's ceiling. It is not a
+plan, not a renewal, and it does not grant a new period.
+
+### The price — decided from `pricing/reseller-pricing-model.md` §2
+
+The fee is **on top** of the token value:
+
+| Customer asks for | They are charged | Credit added |
+|---|---|---|
+| $10.00 of tokens | **$11.50** | $10.00 |
+| $100.00 of tokens | $115.00 | $100.00 |
+
+So `credit = paid ÷ 1.15`. The reseller sees **one blended number** — never
+"tokens $X + fee $Y" (the One Rule). The line item reads simply `Token top-up`.
+
+### Why an external charge, not a catalog plan
+
+"One-time, min $10, no max" cannot be a catalog plan: a Kill Bill plan carries a
+fixed price, so an arbitrary amount is not expressible. A top-up is therefore an
+**EXTERNAL CHARGE**:
+
+```
+POST /1.0/kb/invoices/charges/{accountId}?autoCommit=true
+[{"amount": 11.50, "currency": "USD", "description": "Token top-up",
+  "itemDetails": "CUSTODIAN_TOPUP"}]
+```
+
+`itemDetails` carries `TOPUP_MARKER`. That marker is the only thing that
+distinguishes a top-up payment from a subscription payment — the push payload
+carries no amount and no item detail, so the invoice's items must be read back.
+
+Note: a failed invoice lookup **fails the event**. It must never be read as "a
+subscription payment", because that would set the ceiling to the plan value and
+quietly erase a customer's credit.
+
+### The ledger, and the two traps it closes
+
+```
+ceiling = plan_budget + (topup_granted − topup_committed)
+```
+
+The plan allowance is consumed **first**, so credit only starts burning once real
+spend passes `plan_budget`.
+
+**Trap 1 — a subscription payment erasing a top-up.** The payment path used to set
+the ceiling to the bare plan value, so a customer who topped up and then renewed
+would silently lose the credit. It now sets `plan + unconsumed`.
+
+**Trap 2 — a one-time top-up becoming recurring.** LiteLLM zeroes `spend` monthly
+but never `max_budget`. Without bookkeeping every top-up would come back in full on
+the 1st, forever. Consumption is therefore committed to the ledger at each
+**period boundary** — a subscription payment, or the calendar reset detected by a
+change in `budget_reset_at` during the sweep.
+
+Consumption is committed **only** at a boundary: shrinking the ceiling mid-period
+while spend climbs would subtract the same dollars twice.
+
+The sweep samples `last_spend` between runs, so a burst inside the final sampling
+window **under**-counts consumption and leaves the customer a little extra credit.
+It fails in the customer's favour, never the other way round.
+
+### Selling one
+
+```bash
+kb_bridge.py topup --account-id <uuid> --budget-amount 10
+```
+
+Prints the charge and the invoice id. The customer pays that invoice through the
+normal payment path; the budget is credited when `INVOICE_PAYMENT_SUCCESS` arrives.
+
+### Minimum
+
+`MIN_TOPUP_TOKENS = 10.0` — $10 of tokens, i.e. a $11.50 charge. Enforced in the CLI.
 
 ## The sweep (reconciliation)
 
