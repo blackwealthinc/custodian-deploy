@@ -52,6 +52,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -213,6 +214,27 @@ DRAIN_BUDGET_SECONDS = float(cfg("KB_DRAIN_BUDGET_SECONDS", "3"))
 ACTION_PAYMENT = "INVOICE_PAYMENT_SUCCESS"
 ACTION_CANCEL = ("SUBSCRIPTION_CANCEL", "SUBSCRIPTION_EXPIRED")
 
+# --------------------------------------------------------------------------- #
+# Phase 2 — top-ups
+# --------------------------------------------------------------------------- #
+# The fee lives ON TOP of the token value, per pricing/reseller-pricing-model.md §2:
+#   "When a reseller reloads tokens, we charge 15% on top ... reseller reloads
+#    $10.00 of tokens -> pays $11.50"   (5% processing + 10% us)
+# So the credit the customer receives is what they PAID divided by 1.15. The
+# mapping lives here, once, and is never itemised in anything the reseller sees
+# (the One Rule: one blended price).
+TOPUP_FEE_DIVISOR = 1.15
+
+# Written into the Kill Bill invoice item so a paid top-up can be told apart from
+# a subscription payment. A catalog plan cannot express an arbitrary amount
+# ("one-time, min $10, no max"), so a top-up is created as an EXTERNAL CHARGE and
+# this string rides in the item's itemDetails.
+TOPUP_MARKER = "CUSTODIAN_TOPUP"
+
+# Minimum top-up, in TOKENS (the amount credited), per the build plan:
+# "one-time, min $10, no max". The charge is 1.15x this.
+MIN_TOPUP_TOKENS = 10.0
+
 SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
@@ -254,6 +276,23 @@ CREATE TABLE IF NOT EXISTS accounts (
     -- NEVER store the plaintext key here.
     litellm_key_hash TEXT,
     plan       TEXT,
+    -- ---- Top-up ledger (Phase 2) -------------------------------------------- #
+    -- A top-up RAISES the ceiling; it does not grant a new period. The plan
+    -- allowance is consumed FIRST, so top-up credit only starts burning once
+    -- real spend passes plan_budget. See the top-up policy note in
+    -- kb-bridge/README.md.
+    --   ceiling = plan_budget + (topup_granted - topup_committed)
+    -- topup_committed is advanced only at a PERIOD BOUNDARY, because a period's
+    -- own consumption must not shrink the ceiling it is being spent against.
+    plan_budget     REAL,
+    topup_granted   REAL NOT NULL DEFAULT 0,
+    topup_committed REAL NOT NULL DEFAULT 0,
+    -- Value of the LiteLLM budget_reset_at we last saw: a change means the
+    -- calendar reset fired and the period rolled.
+    period_anchor   TEXT,
+    -- Last observed spend. Read just before a reset so the consumption that
+    -- closed the period can be committed to the ledger.
+    last_spend      REAL NOT NULL DEFAULT 0,
     active     INTEGER NOT NULL DEFAULT 1,
     note       TEXT,
     updated_at REAL
@@ -301,6 +340,22 @@ def _migrate(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_events_lease ON events(status, lease_expires_at)"
     )
+    # accounts also gains columns over time. Migrating here (not only in init_db)
+    # means a plain receiver/worker start brings the schema up to date, so an
+    # upgrade cannot silently run against the old shape.
+    acols = {r["name"] for r in conn.execute("PRAGMA table_info(accounts)")}
+    if acols:
+        for col, decl in (
+            ("litellm_key_hash", "TEXT"),
+            ("plan_budget", "REAL"),
+            ("topup_granted", "REAL NOT NULL DEFAULT 0"),
+            ("topup_committed", "REAL NOT NULL DEFAULT 0"),
+            ("period_anchor", "TEXT"),
+            ("last_spend", "REAL NOT NULL DEFAULT 0"),
+        ):
+            if col not in acols:
+                LOG.info("migrating: adding accounts.%s", col)
+                conn.execute(f"ALTER TABLE accounts ADD COLUMN {col} {decl}")  # noqa: S608 - fixed literals
     _SCHEMA_READY = True
 
 
@@ -334,6 +389,17 @@ def init_db(seed: bool = True) -> None:
         if "litellm_key_hash" not in cols:
             conn.execute("ALTER TABLE accounts ADD COLUMN litellm_key_hash TEXT")
             LOG.info("migrated accounts: added litellm_key_hash")
+        # Phase 2 top-up ledger. Same trap, same idempotent fix.
+        for col, decl in (
+            ("plan_budget", "REAL"),
+            ("topup_granted", "REAL NOT NULL DEFAULT 0"),
+            ("topup_committed", "REAL NOT NULL DEFAULT 0"),
+            ("period_anchor", "TEXT"),
+            ("last_spend", "REAL NOT NULL DEFAULT 0"),
+        ):
+            if col not in cols:
+                conn.execute(f"ALTER TABLE accounts ADD COLUMN {col} {decl}")  # noqa: S608
+                LOG.info("migrated accounts: added %s", col)
         if seed:
             now = time.time()
             defaults = [("basic", 5.0, 0.0), ("pro", 20.0, 0.0), ("business", 100.0, 0.0)]
@@ -352,7 +418,7 @@ def init_db(seed: bool = True) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def http_json_hdrs(method: str, url: str, body: dict | None = None, headers: dict | None = None,
+def http_json_hdrs(method: str, url: str, body: dict | list | None = None, headers: dict | None = None,
                    timeout: float = HTTP_TIMEOUT) -> tuple[int, dict | list | str, dict]:
     """Same as http_json but also returns the response headers.
 
@@ -386,7 +452,7 @@ def http_json_hdrs(method: str, url: str, body: dict | None = None, headers: dic
         return 0, f"{type(exc).__name__}: {exc}", {}
 
 
-def http_json(method: str, url: str, body: dict | None = None, headers: dict | None = None,
+def http_json(method: str, url: str, body: dict | list | None = None, headers: dict | None = None,
               timeout: float = HTTP_TIMEOUT) -> tuple[int, dict | list | str]:
     status, parsed, _ = http_json_hdrs(method, url, body, headers, timeout)
     return status, parsed
@@ -412,6 +478,49 @@ def litellm_set_budget(budget_id: str, max_budget: float) -> tuple[bool, str]:
         return True, f"created budget_id={budget_id} max_budget={max_budget}"
 
     return False, f"budget/update http={status} {str(resp)[:160]}; budget/new http={status2} {str(resp2)[:160]}"
+
+
+def litellm_key_state(key_ref: str) -> tuple[bool, dict | str]:
+    """GET /key/info -> everything the top-up ledger needs, in ONE call.
+
+    Verified live against v1.95.0: `/key/info` is a **GET** with a query param
+    (a POST returns 405), and a single response carries BOTH the key's own `spend`
+    and the linked budget's `max_budget` / `budget_duration` / `budget_reset_at`
+    under `litellm_budget_table`. Accepts the plaintext key or its sha256 hash
+    (`_hash_token_if_needed` hashes only `sk-`-prefixed values).
+    """
+    url = f"{LITELLM_URL}/key/info?key={urllib.parse.quote(key_ref, safe='')}"
+    status, resp = http_json("GET", url, None, litellm_headers())
+    if status != 200 or not isinstance(resp, dict):
+        return False, f"key/info http={status} {str(resp)[:160]}"
+    info = resp.get("info") or {}
+    bt = info.get("litellm_budget_table") or {}
+    return True, {
+        "spend": float(info.get("spend") or 0.0),
+        "max_budget": bt.get("max_budget", info.get("max_budget")),
+        "budget_duration": bt.get("budget_duration", info.get("budget_duration")),
+        "budget_reset_at": bt.get("budget_reset_at", info.get("budget_reset_at")),
+        "budget_id": info.get("budget_id") or bt.get("budget_id"),
+    }
+
+
+def litellm_add_budget(budget_id: str, credit: float) -> tuple[bool, str]:
+    """Raise a budget's ceiling by `credit`: read the current value, then set the sum.
+
+    `credit` may be negative. This is the fallback path -- the normal path
+    recomputes the whole ceiling from the ledger (plan baseline + unconsumed
+    top-up credit), which is robust to a stale ceiling.
+    """
+    status, resp = http_json(
+        "POST", f"{LITELLM_URL}/budget/info", {"budgets": [budget_id]}, litellm_headers()
+    )
+    if status != 200 or not isinstance(resp, list) or not resp:
+        return False, f"budget/info http={status} {str(resp)[:160]}"
+    current = resp[0].get("max_budget")
+    if current is None:
+        return False, f"budget {budget_id} has no max_budget to add to"
+    target = max(0.0, round(float(current) + float(credit), 6))
+    return litellm_set_budget(budget_id, target)
 
 
 def litellm_reset_spend(key_ref: str, reset_to: float = 0.0) -> tuple[bool, str]:
@@ -554,6 +663,171 @@ def killbill_verify_subscription_ended(account_id: str, subscription_id: str) ->
 # --------------------------------------------------------------------------- #
 
 
+def killbill_invoice_items(invoice_id: str) -> tuple[bool, str, list]:
+    """Fetch one invoice and return (ok, reason, items).
+
+    The push payload carries only five fields -- no amount, no item detail -- so a
+    payment CANNOT be classified without asking the engine what was paid for.
+
+    Uses the same endpoint/URL form as `killbill_verify_invoice_paid`, which has
+    already fetched this object once for its own fail-closed checks (ownership,
+    COMMITTED, balance 0). The two are kept separate on purpose: the verify path
+    is a security control with its own carefully-earned comments, and this helper
+    must not change its behaviour.
+    """
+    if not killbill_configured():
+        return False, "Kill Bill not configured", []
+    if not invoice_id:
+        return False, "no invoice id to fetch", []
+    status, resp = http_json(
+        "GET", f"{KILLBILL_URL}/1.0/kb/invoices/{invoice_id}", None, killbill_headers()
+    )
+    if status != 200 or not isinstance(resp, dict):
+        return False, f"invoice fetch http={status} {str(resp)[:160]}", []
+    items = resp.get("items")
+    if not isinstance(items, list):
+        return False, "invoice has no item list", []
+    return True, "ok", items
+
+
+def classify_invoice(account_id: str, invoice_id: str) -> tuple[bool, bool, str, float]:
+    """Return (lookup_ok, is_topup, reason, topup_charge).
+
+    A top-up is identified by TOPUP_MARKER in the item's `itemDetails`, falling
+    back to `description`. Everything else on the account is a subscription
+    payment.
+
+    lookup_ok is SEPARATE from is_topup on purpose: a failed lookup must fail the
+    event rather than be silently read as "subscription payment", which would set
+    the ceiling to the plan value and quietly erase a customer's top-up credit.
+    """
+    ok, why, items = killbill_invoice_items(invoice_id)
+    if not ok:
+        return False, False, why, 0.0
+    for it in items:
+        blob = f"{it.get('itemDetails') or ''} {it.get('description') or ''}"
+        if TOPUP_MARKER in blob:
+            try:
+                amount = float(it.get("amount") or 0.0)
+            except (TypeError, ValueError):
+                return True, False, "top-up item has a non-numeric amount", 0.0
+            return True, True, f"top-up item {it.get('invoiceItemId')} charge={amount}", amount
+    return True, False, "no top-up marker (subscription payment)", 0.0
+
+
+# --------------------------------------------------------------------------- #
+# Top-up ledger
+# --------------------------------------------------------------------------- #
+# ceiling = plan allowance + UNCONSUMED top-up credit
+# The plan allowance is consumed first, so top-up credit only starts burning once
+# real spend passes plan_budget. Consumption is committed to the ledger only at a
+# PERIOD BOUNDARY: shrinking the ceiling mid-period while spend climbs would
+# subtract the same dollars twice.
+
+
+def account_plan_budget(conn: sqlite3.Connection, acct: sqlite3.Row) -> float:
+    """The plan baseline for an account, derived from `plans` when unset."""
+    if acct["plan_budget"] is not None:
+        return float(acct["plan_budget"])
+    prow = conn.execute(
+        "SELECT max_budget FROM plans WHERE plan_name=?", (acct["plan"],)
+    ).fetchone()
+    base = float(prow["max_budget"]) if prow else 0.0
+    conn.execute(
+        "UPDATE accounts SET plan_budget=?, updated_at=? WHERE account_id=?",
+        (base, time.time(), acct["account_id"]),
+    )
+    LOG.info("backfilled plan_budget=%.6f for account %s", base, acct["account_id"])
+    return base
+
+
+def topup_ceiling(acct: sqlite3.Row, plan_budget: float) -> float:
+    granted = float(acct["topup_granted"] or 0.0)
+    committed = float(acct["topup_committed"] or 0.0)
+    return round(plan_budget + max(0.0, granted - committed), 6)
+
+
+def commit_period_consumption(
+    conn: sqlite3.Connection, acct: sqlite3.Row, plan_budget: float, closing_spend: float
+) -> float:
+    """Move a closing period's overage into topup_committed.
+
+    Overage = spend beyond the plan allowance = the part the top-up paid for.
+    Without this step the credit would be fully available again after every reset,
+    i.e. a one-time top-up would silently become a recurring monthly allowance.
+    """
+    committed = float(acct["topup_committed"] or 0.0)
+    overage = max(0.0, float(closing_spend) - plan_budget)
+    committed = round(committed + overage, 6)
+    conn.execute(
+        "UPDATE accounts SET topup_committed=?, updated_at=? WHERE account_id=?",
+        (committed, time.time(), acct["account_id"]),
+    )
+    if overage > 0:
+        LOG.info(
+            "account %s closed a period with spend=%.6f -> top-up consumed %.6f "
+            "(committed total %.6f)",
+            acct["account_id"], closing_spend, overage, committed,
+        )
+    return committed
+
+
+def reconcile_budgets(conn: sqlite3.Connection) -> int:
+    """Keep every ceiling equal to plan + unconsumed top-up credit.
+
+    This exists for the CALENDAR reset. LiteLLM zeroes `spend` on the 1st and
+    advances `budget_reset_at`, and no Kill Bill event fires, so without this pass
+    the closed period's consumption would never be committed and a one-time top-up
+    would quietly become a permanent monthly allowance.
+
+    Fails in the customer's favour: `last_spend` is sampled between sweeps, so a
+    burst in the final sampling window under-counts consumption and leaves the
+    customer a little extra credit. Never the other way round.
+    """
+    changed = 0
+    rows = conn.execute(
+        "SELECT * FROM accounts WHERE active=1 AND budget_id IS NOT NULL "
+        "AND litellm_key_hash IS NOT NULL AND litellm_key_hash != ''"
+    ).fetchall()
+    for acct in rows:
+        ok, st = litellm_key_state(acct["litellm_key_hash"])
+        if not ok or not isinstance(st, dict):
+            LOG.warning("reconcile: %s: %s", acct["account_id"], st)
+            continue
+        plan_budget = account_plan_budget(conn, acct)
+        anchor = (st.get("budget_reset_at") or "").strip()
+        rolled = bool(anchor) and anchor != (acct["period_anchor"] or "")
+        if rolled:
+            commit_period_consumption(conn, acct, plan_budget, float(acct["last_spend"] or 0.0))
+            conn.execute(
+                "UPDATE accounts SET period_anchor=?, last_spend=0, updated_at=? "
+                "WHERE account_id=?",
+                (anchor, time.time(), acct["account_id"]),
+            )
+            acct = conn.execute(
+                "SELECT * FROM accounts WHERE account_id=?", (acct["account_id"],)
+            ).fetchone()
+            LOG.info("reconcile: %s period rolled -> %s", acct["account_id"], anchor)
+
+        desired = topup_ceiling(acct, plan_budget)
+        current = st.get("max_budget")
+        if current is None or abs(float(current) - desired) > 1e-9:
+            ok2, msg = litellm_set_budget(acct["budget_id"], desired)
+            if ok2:
+                changed += 1
+                LOG.info(
+                    "reconcile: %s ceiling %s -> %.6f", acct["account_id"], current, desired
+                )
+            else:
+                LOG.warning("reconcile: %s set failed: %s", acct["account_id"], msg)
+
+        conn.execute(
+            "UPDATE accounts SET last_spend=?, updated_at=? WHERE account_id=?",
+            (float(st.get("spend") or 0.0), time.time(), acct["account_id"]),
+        )
+    return changed
+
+
 def payment_id_of(payload: dict) -> str:
     """Return the payment identity Kill Bill publishes in `metaData`.
 
@@ -691,7 +965,59 @@ def process_event(conn: sqlite3.Connection, row: sqlite3.Row) -> tuple[str, str]
         prow = conn.execute("SELECT * FROM plans WHERE plan_name=?", (plan,)).fetchone()
         if prow is None:
             return "failed", f"no plan row for plan={plan!r} (account {account_id})"
-        amount = float(prow["max_budget"])
+        plan_budget = account_plan_budget(conn, acct)
+
+        # Which kind of payment is this? A top-up and a subscription payment move
+        # the ceiling in different ways, and the push payload does not say which
+        # it is -- only the invoice's items do.
+        lookup_ok, is_topup, why, charge = classify_invoice(account_id, row["object_id"] or "")
+        if not lookup_ok:
+            return "failed", f"cannot classify the paid invoice: {why}"
+
+        if is_topup:
+            credit = round(charge / TOPUP_FEE_DIVISOR, 6)
+            if credit <= 0:
+                return "failed", f"top-up charge {charge} yields no credit"
+            granted = round(float(acct["topup_granted"] or 0.0) + credit, 6)
+            conn.execute(
+                "UPDATE accounts SET topup_granted=?, updated_at=? WHERE account_id=?",
+                (granted, time.time(), account_id),
+            )
+            acct = conn.execute(
+                "SELECT * FROM accounts WHERE account_id=?", (account_id,)
+            ).fetchone()
+            ceiling = topup_ceiling(acct, plan_budget)
+            ok, msg = litellm_set_budget(budget_id, ceiling)
+            # A top-up raises the ceiling ONLY. It deliberately does NOT clear
+            # accrued spend -- that would hand the customer a free period every
+            # time they reload, and would let a top-up buy more than it paid for.
+            return (("done" if ok else "failed"),
+                    f"top-up: charged {charge} -> credit {credit:.6f}; "
+                    f"granted total {granted:.6f}; ceiling {ceiling:.6f}; {msg}")
+
+        # A subscription payment zeroes spend, i.e. it ends a period. Commit what
+        # the closing period consumed BEFORE erasing it, or the top-up credit would
+        # come back in full every month (the recurring-top-up trap).
+        closing = float(acct["last_spend"] or 0.0)
+        key_hash = (acct["litellm_key_hash"] or "").strip()
+        if key_hash:
+            okst, st = litellm_key_state(key_hash)
+            if okst and isinstance(st, dict):
+                closing = float(st.get("spend") or 0.0)
+            else:
+                LOG.warning(
+                    "account %s: could not read spend before reset (%s); "
+                    "using last sampled value %.6f", account_id, st, closing,
+                )
+        commit_period_consumption(conn, acct, plan_budget, closing)
+        acct = conn.execute(
+            "SELECT * FROM accounts WHERE account_id=?", (account_id,)
+        ).fetchone()
+
+        # The ceiling is plan + UNCONSUMED top-up, never the bare plan value:
+        # setting it to the plan alone is what silently erased a customer's
+        # top-up on the next subscription payment.
+        amount = topup_ceiling(acct, plan_budget)
         ok, msg = litellm_set_budget(budget_id, amount)
 
         # Bug #156 follow-up: raising the ceiling is NOT enough. LiteLLM blocks on
@@ -1363,6 +1689,16 @@ def run_sweep(once: bool = False) -> int:
     conn = db()
     try:
         while True:
+            # Phase 2: keep every ceiling equal to plan + unconsumed top-up credit.
+            # Its own guard so a ledger problem can never stop the invoice
+            # reconciliation below, which is the safety net for missed webhooks.
+            try:
+                n_reconciled = reconcile_budgets(conn)
+                if n_reconciled:
+                    LOG.info("sweep: reconciled %d budget ceiling(s)", n_reconciled)
+            except Exception as exc:  # noqa: BLE001 - never let this kill the sweep
+                LOG.exception("sweep: budget reconcile failed: %s", exc)
+
             examined = 0
             added = 0
             skipped_known = 0
@@ -1605,6 +1941,48 @@ def run_plan(args) -> int:
 # --------------------------------------------------------------------------- #
 
 
+def run_topup(args) -> int:
+    """Sell a top-up by creating the Kill Bill external charge that represents it.
+
+    A catalog plan cannot express an arbitrary amount ("one-time, min $10, no
+    max"), so a top-up is an EXTERNAL CHARGE carrying TOPUP_MARKER in itemDetails.
+    The customer pays the resulting invoice through the normal payment path, and
+    the bridge credits the budget when INVOICE_PAYMENT_SUCCESS arrives -- at
+    `paid / TOPUP_FEE_DIVISOR`, i.e. the fee is ON TOP (pricing model §2).
+
+    The line item is a single blended figure on purpose. Never print or invoice
+    "tokens $X + fee $Y" -- the One Rule: one number, no itemised breakdown.
+    """
+    init_db()
+    if not killbill_configured():
+        print("Kill Bill is not configured (KB_KILLBILL_URL + api key/secret + user/password)")
+        return 1
+
+    tokens = float(args.budget_amount)
+    if tokens < MIN_TOPUP_TOKENS:
+        print(f"refusing: the minimum top-up is ${MIN_TOPUP_TOKENS:.2f} of tokens")
+        return 2
+    charge = round(tokens * TOPUP_FEE_DIVISOR, 2)
+
+    body = [{
+        "amount": charge,
+        "currency": args.currency,
+        "description": "Token top-up",
+        "itemDetails": TOPUP_MARKER,
+    }]
+    url = f"{KILLBILL_URL}/1.0/kb/invoices/charges/{args.account_id}?autoCommit=true"
+    status, resp = http_json("POST", url, body, killbill_headers())
+    if status not in (200, 201) or not isinstance(resp, list) or not resp:
+        print(f"external charge failed: http={status} {str(resp)[:300]}")
+        return 1
+
+    invoice_id = resp[0].get("invoiceId")
+    print(f"top-up: ${tokens:.2f} of tokens -> a single charge of ${charge:.2f}")
+    print(f"invoice: {invoice_id}")
+    print("the customer pays that invoice; the budget is credited on INVOICE_PAYMENT_SUCCESS")
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Kill Bill -> LiteLLM budget bridge")
     p.add_argument("--log-level", default=os.environ.get("KB_LOG_LEVEL", "INFO"))
@@ -1634,6 +2012,13 @@ def main() -> int:
     pl.add_argument("--max-budget", type=float, required=True)
     pl.add_argument("--on-cancel", type=float, default=0.0)
 
+    tp = sub.add_parser("topup", help="create a top-up charge on a customer account")
+    tp.add_argument("--account-id", required=True)
+    tp.add_argument("--budget-amount", type=float, required=True,
+                    help="TOKENS to credit, e.g. 10 for $10 of tokens "
+                         f"(minimum ${MIN_TOPUP_TOKENS:.2f}); the charge is 1.15x this")
+    tp.add_argument("--currency", default="USD")
+
     args = p.parse_args()
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), logging.INFO),
@@ -1656,6 +2041,8 @@ def main() -> int:
         return run_map(args)
     if args.cmd == "plan":
         return run_plan(args)
+    if args.cmd == "topup":
+        return run_topup(args)
     p.print_help()
     return 2
 
