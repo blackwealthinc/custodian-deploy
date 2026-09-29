@@ -520,9 +520,14 @@ def litellm_set_budget(budget_id: str, max_budget: float, key_ref: str = "") -> 
     do not send (e.g. the `budget_duration` set at provisioning) are preserved.
 
     The budget-object write is kept as the fallback for an account with no key
-    hash, so nothing that used to work stops working.
+    hash, so nothing that used to work stops working. Neither target is
+    mandatory on its own: provisioning creates keys that carry their own
+    ceiling and are linked to NO budget object, so a mapping with a key hash
+    and a NULL budget_id is a normal, fully-working account (2026-09-29).
     """
     key_ref = (key_ref or "").strip()
+    if not key_ref and not (budget_id or "").strip():
+        return False, "no key hash and no budget_id - nowhere to write the ceiling"
     if key_ref:
         status, resp = http_json(
             "POST", f"{LITELLM_URL}/key/update",
@@ -953,7 +958,12 @@ def reconcile_budgets(conn: sqlite3.Connection) -> int:
     """
     changed = 0
     rows = conn.execute(
-        "SELECT * FROM accounts WHERE active=1 AND budget_id IS NOT NULL "
+        # Keyed on the KEY HASH, not the budget_id. Provisioning creates keys
+        # that carry their own ceiling and are linked to no budget object, so a
+        # budget_id-keyed query silently skipped every real customer: their
+        # closed period was never committed and a one-time top-up quietly became
+        # a permanent monthly allowance (2026-09-29).
+        "SELECT * FROM accounts WHERE active=1 "
         "AND litellm_key_hash IS NOT NULL AND litellm_key_hash != ''"
     ).fetchall()
     for acct in rows:
@@ -1107,8 +1117,18 @@ def process_event(conn: sqlite3.Connection, row: sqlite3.Row) -> tuple[str, str]
         return "skipped", f"no active mapping for account {account_id}"
 
     budget_id = acct["budget_id"]
-    if not budget_id:
-        return "failed", f"mapping for {account_id} has no budget_id"
+    key_hash = (acct["litellm_key_hash"] or "").strip()
+    # The ceiling lives ON THE KEY, and provisioning creates keys that carry
+    # their own max_budget and are linked to NO budget object. Requiring a
+    # budget_id here therefore refused every freshly provisioned customer with
+    # "mapping ... has no budget_id", even though the write path no longer needs
+    # one. Require a DESTINATION instead: the key hash, or the budget object as
+    # the legacy fallback (2026-09-29).
+    if not key_hash and not budget_id:
+        return "failed", (
+            f"mapping for {account_id} has neither a litellm_key_hash nor a "
+            "budget_id - nowhere to write the ceiling"
+        )
 
     if VERIFY:
         if etype == ACTION_PAYMENT:
@@ -2113,10 +2133,10 @@ def run_map(args) -> int:
             "                          accounts.litellm_key_hash),"
             " plan=excluded.plan, active=excluded.active,"
             " note=excluded.note, rail=excluded.rail, updated_at=excluded.updated_at",
-            (args.account_id, args.budget_id, args.key_alias, key_hash, args.plan,
+            (args.account_id, (args.budget_id or None), args.key_alias, key_hash, args.plan,
              0 if args.disable else 1, args.note, args.rail, time.time()),
         )
-        print(f"mapped account {args.account_id} -> budget {args.budget_id} "
+        print(f"mapped account {args.account_id} -> budget {args.budget_id or '(none - key carries the ceiling)'} "
               f"plan={args.plan} active={not args.disable} rail={args.rail} "
               f"key_hash={'set' if key_hash else 'not set'}")
         return 0
@@ -2202,7 +2222,12 @@ def main() -> int:
 
     m = sub.add_parser("map")
     m.add_argument("--account-id", required=True)
-    m.add_argument("--budget-id", required=True)
+    m.add_argument("--budget-id", default="",
+                   help="OPTIONAL. LiteLLM budget object id. Provisioning creates keys "
+                        "that carry their own max_budget and are linked to NO budget "
+                        "object, so a real customer normally has none. The ceiling is "
+                        "written on the key; this is only the legacy fallback for an "
+                        "account with no key hash.")
     m.add_argument("--plan", default="basic")
     m.add_argument("--rail", default="card", choices=("card", "manual"),
                    help="which rail collects this account's money. 'card' (default) "
