@@ -131,6 +131,10 @@ PATH_TOKEN = os.environ.get("KB_PATH_TOKEN", "")
 LITELLM_URL = cfg("KB_LITELLM_URL", "http://127.0.0.1:4000").rstrip("/")
 LITELLM_KEY = os.environ.get("KB_LITELLM_MASTER_KEY", "")
 BUDGET_DURATION = os.environ.get("KB_BUDGET_DURATION", "").strip()
+
+# Kill Bill requires this header on every write. Kept as its own constant so the
+# required-on-POST detail lives next to the other Kill Bill settings.
+KB_CREATED_BY = os.environ.get("KB_CREATED_BY", "kb-bridge")
 KILLBILL_URL = cfg("KB_KILLBILL_URL", "").rstrip("/")
 KB_API_KEY = os.environ.get("KB_KILLBILL_API_KEY", "")
 KB_API_SECRET = os.environ.get("KB_KILLBILL_API_SECRET", "")
@@ -563,6 +567,10 @@ def killbill_headers() -> dict:
     if KB_USER and KB_PASSWORD:
         token = base64.b64encode(f"{KB_USER}:{KB_PASSWORD}".encode()).decode()
         h["Authorization"] = f"Basic {token}"
+    # Kill Bill REQUIRES X-Killbill-CreatedBy on writes; without it a POST fails
+    # with `Header X-Killbill-CreatedBy needs to be set` (found by running the
+    # top-up path: the GET-only callers never needed it). Harmless on reads.
+    h["X-Killbill-CreatedBy"] = KB_CREATED_BY
     return h
 
 
