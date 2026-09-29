@@ -539,6 +539,16 @@ def litellm_set_budget(budget_id: str, max_budget: float, key_ref: str = "") -> 
             "key/update failed (%s): %s -- falling back to budget object %s",
             status, str(resp)[:200], budget_id,
         )
+        # If there is no budget object to fall back to, STOP. Without this the
+        # code below posts `budget_id: null` and LiteLLM CREATES a junk budget
+        # row with a random uuid -- a blind object that nothing enforces. A
+        # failed key write must be a visible failure, never a quiet write
+        # somewhere harmless (observed live 2026-09-29).
+        if not (budget_id or "").strip():
+            return False, (
+                f"key/update failed ({status}) and the mapping has no budget_id to "
+                f"fall back to - ceiling NOT set. {str(resp)[:160]}"
+            )
 
     payload: dict = {"budget_id": budget_id, "max_budget": max_budget}
     if BUDGET_DURATION:
