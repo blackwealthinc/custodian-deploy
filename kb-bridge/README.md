@@ -215,6 +215,58 @@ normal payment path; the budget is credited when `INVOICE_PAYMENT_SUCCESS` arriv
 
 `MIN_TOPUP_TOKENS = 10.0` — $10 of tokens, i.e. a $11.50 charge. Enforced in the CLI.
 
+## How the money is actually collected (no new glue)
+
+Decided in `research/stripe-crypto-decisions-research-2026-09-18.txt` §1.2 and now
+confirmed at source in the plugin's `stripe-plugin-8.0.4` tag:
+
+1. the customer saves a card on the plugin's **hosted checkout**
+   (`POST /plugins/killbill-stripe/checkout`, session `mode: "setup"`, $0 — it saves a
+   method, it does not take money);
+2. when Kill Bill commits **any** invoice for that account — a subscription renewal
+   *or* a top-up external charge — the engine auto-pays it by calling the plugin's
+   `purchasePayment`, which builds a Stripe **PaymentIntent with `confirm = true`**
+   for the invoice amount against the **saved** method. That is a real charge;
+3. Stripe settles, Kill Bill emits `INVOICE_PAYMENT_SUCCESS`, and the bridge credits
+   the budget. Nothing else is needed.
+
+That last point is why a top-up needs no checkout of its own: the external charge is
+committed, auto-pay collects it.
+
+### The rail guard — a payment is not proof of money
+
+The same auto-pay reaches for Kill Bill's built-in **`__EXTERNAL_PAYMENT__`** plugin
+when an account's default payment method is not a real gateway. That plugin exists to
+*record money that arrived outside Kill Bill*, so a payment it records proves nothing —
+and on 2026-09-29 one such payment settled a real top-up invoice **with no money
+anywhere**, which the bridge credited (payment `8ebe8921`).
+
+Every account therefore carries a rail:
+
+| `rail` | Meaning | A `__EXTERNAL_PAYMENT__` payment |
+|---|---|---|
+| `card` (default) | Stripe auto-charges the saved method | **refused**, event fails with a reason |
+| `manual` | crypto/offline — a hand-recorded payment IS the confirmation | credited |
+
+Fail-closed by design: the default is `card`, so anything that is not a real gateway
+settlement is refused loudly rather than quietly becoming tokens. Set the rail with
+`kb_bridge.py map … --rail manual` for an account collected outside a gateway.
+
+Two companion rules for a `manual` account: tag it **`AUTO_PAY_OFF`** in Kill Bill so
+the engine never fabricates a payment in the first place, and record the payment only
+*after* the gateway confirms it.
+
+### Granting a top-up is idempotent, and part-payments are handled
+
+A top-up invoice carries one row in `topup_grants`, holding the credit earned so far.
+The entitlement is recomputed from the amount **actually paid** on the invoice
+(`amount − balance`, capped at the line item), and only the **delta** reaches the
+ledger:
+
+- a duplicated payment event earns `delta = 0` — it cannot credit twice;
+- a $5.75 part-payment on an $11.50 invoice earns $5.00, and paying the remaining
+  $5.75 later earns the other $5.00 — never $10 twice.
+
 ## The sweep (reconciliation)
 
 Reads **invoices**, not payments — the documented **balance search**:

@@ -235,6 +235,12 @@ TOPUP_FEE_DIVISOR = 1.15
 # this string rides in the item's itemDetails.
 TOPUP_MARKER = "CUSTODIAN_TOPUP"
 
+# Kill Bill's built-in bookkeeping plugin. It exists to record money that arrived
+# OUTSIDE Kill Bill, so a payment it records proves nothing about money -- and the
+# engine also reaches for it when an account's default payment method is not a
+# real gateway. Only a real gateway plugin settling a confirmed charge is revenue.
+BOOKKEEPING_PLUGIN = "__EXTERNAL_PAYMENT__"
+
 # Minimum top-up, in TOKENS (the amount credited), per the build plan:
 # "one-time, min $10, no max". The charge is 1.15x this.
 MIN_TOPUP_TOKENS = 10.0
@@ -299,7 +305,29 @@ CREATE TABLE IF NOT EXISTS accounts (
     last_spend      REAL NOT NULL DEFAULT 0,
     active     INTEGER NOT NULL DEFAULT 1,
     note       TEXT,
+    -- Which rail actually collects this account's money.
+    --   'card'   = Kill Bill auto-charges the saved Stripe payment method. A
+    --              payment recorded through the __EXTERNAL_PAYMENT__ bookkeeping
+    --              plugin is therefore NOT money, and the bridge refuses it.
+    --   'manual' = crypto/offline: a payment is recorded by hand only AFTER the
+    --              gateway confirms it, so bookkeeping payments ARE credited.
+    -- Default is the safe one: refuse anything that is not a real rail.
+    rail       TEXT NOT NULL DEFAULT 'card',
     updated_at REAL
+);
+
+-- One row per top-up invoice, holding the credit granted so far. This is what
+-- makes the grant IDEMPOTENT and partial-payment-correct: the entitlement is
+-- recomputed from the amount actually PAID on the invoice, and only the DELTA is
+-- added to the ledger. So a duplicated event grants 0 (instead of granting the
+-- whole credit again), and a second instalment grants only the remainder.
+CREATE TABLE IF NOT EXISTS topup_grants (
+    invoice_id  TEXT PRIMARY KEY,
+    account_id  TEXT NOT NULL,
+    paid        REAL NOT NULL DEFAULT 0,
+    item_total  REAL NOT NULL DEFAULT 0,
+    credit      REAL NOT NULL DEFAULT 0,
+    updated_at  REAL
 );
 
 CREATE TABLE IF NOT EXISTS plans (
@@ -356,6 +384,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
             ("topup_committed", "REAL NOT NULL DEFAULT 0"),
             ("period_anchor", "TEXT"),
             ("last_spend", "REAL NOT NULL DEFAULT 0"),
+            ("rail", "TEXT NOT NULL DEFAULT 'card'"),
         ):
             if col not in acols:
                 LOG.info("migrating: adding accounts.%s", col)
@@ -400,6 +429,7 @@ def init_db(seed: bool = True) -> None:
             ("topup_committed", "REAL NOT NULL DEFAULT 0"),
             ("period_anchor", "TEXT"),
             ("last_spend", "REAL NOT NULL DEFAULT 0"),
+            ("rail", "TEXT NOT NULL DEFAULT 'card'"),
         ):
             if col not in cols:
                 conn.execute(f"ALTER TABLE accounts ADD COLUMN {col} {decl}")  # noqa: S608
@@ -700,11 +730,15 @@ def killbill_verify_subscription_ended(account_id: str, subscription_id: str) ->
 # --------------------------------------------------------------------------- #
 
 
-def killbill_invoice_items(invoice_id: str) -> tuple[bool, str, list]:
-    """Fetch one invoice and return (ok, reason, items).
+def killbill_invoice(invoice_id: str) -> tuple[bool, str, dict]:
+    """Fetch one invoice and return (ok, reason, invoice).
 
     The push payload carries only five fields -- no amount, no item detail -- so a
-    payment CANNOT be classified without asking the engine what was paid for.
+    payment CANNOT be classified without asking the engine what was paid for. The
+    invoice document carries the three things this path needs: the items (what was
+    bought), `amount`, and `balance` -- and balance is computed in SQL as
+    SUM(items) - SUM(successful payments + refunds), so `amount - balance` is the
+    amount actually PAID. That is the only honest basis for a credit.
 
     Uses the same endpoint/URL form as `killbill_verify_invoice_paid`, which has
     already fetched this object once for its own fail-closed checks (ownership,
@@ -713,22 +747,31 @@ def killbill_invoice_items(invoice_id: str) -> tuple[bool, str, list]:
     must not change its behaviour.
     """
     if not killbill_configured():
-        return False, "Kill Bill not configured", []
+        return False, "Kill Bill not configured", {}
     if not invoice_id:
-        return False, "no invoice id to fetch", []
+        return False, "no invoice id to fetch", {}
     status, resp = http_json(
         "GET", f"{KILLBILL_URL}/1.0/kb/invoices/{invoice_id}", None, killbill_headers()
     )
     if status != 200 or not isinstance(resp, dict):
-        return False, f"invoice fetch http={status} {str(resp)[:160]}", []
-    items = resp.get("items")
-    if not isinstance(items, list):
-        return False, "invoice has no item list", []
-    return True, "ok", items
+        return False, f"invoice fetch http={status} {str(resp)[:160]}", {}
+    if not isinstance(resp.get("items"), list):
+        return False, "invoice has no item list", {}
+    return True, "ok", resp
 
 
-def classify_invoice(account_id: str, invoice_id: str) -> tuple[bool, bool, str, float]:
-    """Return (lookup_ok, is_topup, reason, topup_charge).
+def _float_or_none(val) -> float | None:
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def classify_invoice(account_id: str, invoice_id: str) -> tuple[bool, bool, str, dict]:
+    """Return (lookup_ok, is_topup, reason, money).
+
+    `money` carries `item_total` (the top-up line itself) and `paid` (what was
+    actually settled on the invoice).
 
     A top-up is identified by TOPUP_MARKER in the item's `itemDetails`, falling
     back to `description`. Everything else on the account is a subscription
@@ -738,18 +781,26 @@ def classify_invoice(account_id: str, invoice_id: str) -> tuple[bool, bool, str,
     event rather than be silently read as "subscription payment", which would set
     the ceiling to the plan value and quietly erase a customer's top-up credit.
     """
-    ok, why, items = killbill_invoice_items(invoice_id)
+    ok, why, inv = killbill_invoice(invoice_id)
     if not ok:
-        return False, False, why, 0.0
+        return False, False, why, {}
+    items = inv.get("items") or []
+    amount = _float_or_none(inv.get("amount")) or 0.0
+    balance = _float_or_none(inv.get("balance")) or 0.0
+    # `amount - balance` is the settled part (balance is SQL: SUM(items) minus
+    # SUM(successful payments + refunds)). Callers cap the credit against
+    # item_total, so an overpayment can never buy more than was sold.
+    paid = round(amount - balance, 6)
     for it in items:
         blob = f"{it.get('itemDetails') or ''} {it.get('description') or ''}"
         if TOPUP_MARKER in blob:
-            try:
-                amount = float(it.get("amount") or 0.0)
-            except (TypeError, ValueError):
-                return True, False, "top-up item has a non-numeric amount", 0.0
-            return True, True, f"top-up item {it.get('invoiceItemId')} charge={amount}", amount
-    return True, False, "no top-up marker (subscription payment)", 0.0
+            item_total = _float_or_none(it.get("amount"))
+            if item_total is None:
+                return True, False, "top-up item has a non-numeric amount", {}
+            return True, True, (
+                f"top-up item {it.get('invoiceItemId')} charge={item_total} paid={paid}"
+            ), {"item_total": item_total, "paid": paid}
+    return True, False, "no top-up marker (subscription payment)", {"paid": paid}
 
 
 # --------------------------------------------------------------------------- #
@@ -807,6 +858,85 @@ def commit_period_consumption(
             acct["account_id"], closing_spend, overage, committed,
         )
     return committed
+
+
+def payment_plugin_name(payment_id: str) -> tuple[bool, str]:
+    """Which plugin recorded a payment: (ok, pluginName | reason).
+
+    Kill Bill's own `__EXTERNAL_PAYMENT__` plugin is bookkeeping -- it records money
+    that arrived OUTSIDE Kill Bill. It can be driven by a human, and it is ALSO what
+    the engine reaches for when an account's default payment method is not a real
+    gateway. Either way, a payment it records proves nothing about money. Only a
+    real gateway plugin (the Stripe plugin) settling a confirmed charge is revenue.
+
+    Two reads: the payment (for its paymentMethodId), then the method (for its
+    plugin). Both are cheap GETs and this runs once per paying event.
+    """
+    if not payment_id:
+        return False, "no payment id to resolve"
+    status, pay = http_json(
+        "GET", f"{KILLBILL_URL}/1.0/kb/payments/{payment_id}", None, killbill_headers()
+    )
+    if status != 200 or not isinstance(pay, dict):
+        return False, f"payment lookup http={status} {str(pay)[:140]}"
+    pmid = pay.get("paymentMethodId")
+    if not pmid:
+        return False, "payment carries no paymentMethodId"
+    status, pm = http_json(
+        "GET", f"{KILLBILL_URL}/1.0/kb/paymentMethods/{pmid}", None, killbill_headers()
+    )
+    if status != 200 or not isinstance(pm, dict):
+        return False, f"payment method lookup http={status} {str(pm)[:140]}"
+    name = str(pm.get("pluginName") or "")
+    if not name:
+        return False, "payment method carries no pluginName"
+    return True, name
+
+
+def topup_grant_delta(
+    conn: sqlite3.Connection,
+    invoice_id: str,
+    account_id: str,
+    paid: float,
+    item_total: float,
+) -> tuple[float, float, str]:
+    """Record a top-up invoice's entitlement; return (delta, entitlement, why).
+
+    The entitlement is what THIS invoice has earned so far: the amount actually
+    PAID, capped at what was sold, converted to credit. Only the DELTA since the
+    last grant reaches the ledger. That makes the grant idempotent AND correct for
+    instalments:
+
+      * a duplicated payment event recomputes the same entitlement -> delta 0;
+      * a $5.75 part-payment on an $11.50 invoice earns $5.00, and paying the
+        remaining $5.75 later earns the other $5.00 -- never $10 twice.
+
+    Before this, the credit was the ITEM amount granted once per paymentId, so two
+    payments against one invoice paid out twice.
+    """
+    capped = max(0.0, min(float(paid), float(item_total)))
+    entitlement = round(capped / TOPUP_FEE_DIVISOR, 6)
+    row = conn.execute(
+        "SELECT credit FROM topup_grants WHERE invoice_id=?", (invoice_id,)
+    ).fetchone()
+    already = float(row["credit"]) if row else 0.0
+    delta = round(entitlement - already, 6)
+    if delta <= 0:
+        return 0.0, entitlement, (
+            f"invoice {invoice_id} already granted {already:.6f}; nothing further earned"
+        )
+    conn.execute(
+        "INSERT INTO topup_grants(invoice_id,account_id,paid,item_total,credit,updated_at)"
+        " VALUES(?,?,?,?,?,?)"
+        " ON CONFLICT(invoice_id) DO UPDATE SET paid=excluded.paid,"
+        " item_total=excluded.item_total, credit=excluded.credit,"
+        " updated_at=excluded.updated_at",
+        (invoice_id, account_id, float(paid), float(item_total), entitlement, time.time()),
+    )
+    return delta, entitlement, (
+        f"paid {capped:.6f} of {float(item_total):.6f} -> entitlement {entitlement:.6f} "
+        f"(was {already:.6f})"
+    )
 
 
 def reconcile_budgets(conn: sqlite3.Connection) -> int:
@@ -1009,15 +1139,41 @@ def process_event(conn: sqlite3.Connection, row: sqlite3.Row) -> tuple[str, str]
         # Which kind of payment is this? A top-up and a subscription payment move
         # the ceiling in different ways, and the push payload does not say which
         # it is -- only the invoice's items do.
-        lookup_ok, is_topup, why, charge = classify_invoice(account_id, row["object_id"] or "")
+        lookup_ok, is_topup, why, money = classify_invoice(account_id, row["object_id"] or "")
         if not lookup_ok:
             return "failed", f"cannot classify the paid invoice: {why}"
 
+        # Whose money is this? A payment can be recorded by hand through Kill
+        # Bill's bookkeeping plugin, and the engine itself reaches for that plugin
+        # when the account's default payment method is not a real gateway. On a
+        # 'card' account only a real gateway settlement is revenue, so refuse the
+        # rest loudly instead of granting tokens for a payment nobody made.
+        rail = (acct["rail"] or "card").strip().lower()
+        try:
+            pay_id = payment_id_of(json.loads(row["payload"] or "{}"))
+        except (TypeError, ValueError):
+            pay_id = ""
+        if not pay_id:
+            return "failed", "payment event carries no metaData.paymentId - cannot verify the rail"
+        pok, pname = payment_plugin_name(pay_id)
+        if not pok:
+            return "failed", f"cannot resolve the payment's plugin: {pname}"
+        if pname == BOOKKEEPING_PLUGIN and rail != "manual":
+            return "failed", (
+                f"refusing a {pname} payment (rail={rail}, payment {pay_id}): "
+                "bookkeeping payments prove no money arrived"
+            )
+
         if is_topup:
-            credit = round(charge / TOPUP_FEE_DIVISOR, 6)
-            if credit <= 0:
-                return "failed", f"top-up charge {charge} yields no credit"
-            granted = round(float(acct["topup_granted"] or 0.0) + credit, 6)
+            invoice_id = row["object_id"] or ""
+            item_total = float(money.get("item_total") or 0.0)
+            paid = float(money.get("paid") or 0.0)
+            delta, entitlement, why_grant = topup_grant_delta(
+                conn, invoice_id, account_id, paid, item_total
+            )
+            if delta <= 0:
+                return "done", f"top-up already credited: {why_grant}"
+            granted = round(float(acct["topup_granted"] or 0.0) + delta, 6)
             conn.execute(
                 "UPDATE accounts SET topup_granted=?, updated_at=? WHERE account_id=?",
                 (granted, time.time(), account_id),
@@ -1033,7 +1189,7 @@ def process_event(conn: sqlite3.Connection, row: sqlite3.Row) -> tuple[str, str]
             # accrued spend -- that would hand the customer a free period every
             # time they reload, and would let a top-up buy more than it paid for.
             return (("done" if ok else "failed"),
-                    f"top-up: charged {charge} -> credit {credit:.6f}; "
+                    f"top-up: {why_grant}; credit +{delta:.6f}; "
                     f"granted total {granted:.6f}; ceiling {ceiling:.6f}; {msg}")
 
         # A subscription payment zeroes spend, i.e. it ends a period. Commit what
@@ -1942,20 +2098,20 @@ def run_map(args) -> int:
     try:
         conn.execute(
             "INSERT INTO accounts(account_id,budget_id,key_alias,litellm_key_hash,"
-            " plan,active,note,updated_at)"
-            " VALUES(?,?,?,?,?,?,?,?)"
+            " plan,active,note,rail,updated_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?)"
             " ON CONFLICT(account_id) DO UPDATE SET budget_id=excluded.budget_id,"
             " key_alias=excluded.key_alias,"
             # never blank an existing hash just because this call omitted it
             " litellm_key_hash=COALESCE(NULLIF(excluded.litellm_key_hash,''),"
             "                          accounts.litellm_key_hash),"
             " plan=excluded.plan, active=excluded.active,"
-            " note=excluded.note, updated_at=excluded.updated_at",
+            " note=excluded.note, rail=excluded.rail, updated_at=excluded.updated_at",
             (args.account_id, args.budget_id, args.key_alias, key_hash, args.plan,
-             0 if args.disable else 1, args.note, time.time()),
+             0 if args.disable else 1, args.note, args.rail, time.time()),
         )
         print(f"mapped account {args.account_id} -> budget {args.budget_id} "
-              f"plan={args.plan} active={not args.disable} "
+              f"plan={args.plan} active={not args.disable} rail={args.rail} "
               f"key_hash={'set' if key_hash else 'not set'}")
         return 0
     finally:
@@ -2042,6 +2198,11 @@ def main() -> int:
     m.add_argument("--account-id", required=True)
     m.add_argument("--budget-id", required=True)
     m.add_argument("--plan", default="basic")
+    m.add_argument("--rail", default="card", choices=("card", "manual"),
+                   help="which rail collects this account's money. 'card' (default) "
+                        "= Kill Bill auto-charges the saved Stripe method, so a "
+                        "bookkeeping payment is refused; 'manual' = crypto/offline, "
+                        "where a hand-recorded payment IS the confirmation")
     m.add_argument("--key-alias", default="")
     m.add_argument("--key-hash", default="",
                    help="customer LiteLLM key (sk-...) or its sha256 hash. Required for "
