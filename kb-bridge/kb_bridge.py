@@ -466,8 +466,45 @@ def litellm_headers() -> dict:
     return {"Authorization": f"Bearer {LITELLM_KEY}"}
 
 
-def litellm_set_budget(budget_id: str, max_budget: float) -> tuple[bool, str]:
-    """Set a budget's ceiling. Update first; create if it does not exist."""
+def litellm_set_budget(budget_id: str, max_budget: float, key_ref: str = "") -> tuple[bool, str]:
+    """Set a customer's ceiling, ON THE KEY, and return (ok, message).
+
+    The ceiling must be written where the enforcer actually reads it. Verified
+    live against v1.95.0 (A/B/C probe, 2026-09-29):
+
+      * a key created with a `budget_id` and NO own `max_budget` IS blocked at
+        the linked budget object's value, because
+        `LiteLLM_VerificationTokenView.__init__` copies `litellm_budget_table_*`
+        onto the token -- but only `if current is None`;
+      * a key that carries its OWN `max_budget` is blocked at the KEY's value
+        and the linked budget object is IGNORED entirely.
+
+    Our provisioning path (`setup-custodian-factory.sh:39`) creates keys WITH
+    their own `max_budget`, and nothing in the repo ever links them to a budget
+    object. So writing `/budget/update` for a normal customer key moves an
+    object that nothing enforces -- the top-up would silently do nothing.
+
+    Therefore the KEY is the single source of truth. `/key/update` accepts the
+    sha256 hash we store (`_hash_token_if_needed` hashes only `sk-` values) and
+    `prepare_key_update_data` uses `model_dump(exclude_unset=True)`, so fields we
+    do not send (e.g. the `budget_duration` set at provisioning) are preserved.
+
+    The budget-object write is kept as the fallback for an account with no key
+    hash, so nothing that used to work stops working.
+    """
+    key_ref = (key_ref or "").strip()
+    if key_ref:
+        status, resp = http_json(
+            "POST", f"{LITELLM_URL}/key/update",
+            {"key": key_ref, "max_budget": max_budget}, litellm_headers(),
+        )
+        if status == 200:
+            return True, f"updated key max_budget={max_budget}"
+        LOG.warning(
+            "key/update failed (%s): %s -- falling back to budget object %s",
+            status, str(resp)[:200], budget_id,
+        )
+
     payload: dict = {"budget_id": budget_id, "max_budget": max_budget}
     if BUDGET_DURATION:
         payload["budget_duration"] = BUDGET_DURATION
@@ -501,30 +538,22 @@ def litellm_key_state(key_ref: str) -> tuple[bool, dict | str]:
     bt = info.get("litellm_budget_table") or {}
     return True, {
         "spend": float(info.get("spend") or 0.0),
-        "max_budget": bt.get("max_budget", info.get("max_budget")),
+        # The ceiling READ must match the WRITE target (see litellm_set_budget):
+        # the key's own value wins whenever it is set, because that is what the
+        # enforcer reads. Falling back to the budget object keeps the effective
+        # value correct for a key that carries no ceiling of its own.
+        #
+        # `is not None` and not truthiness: 0.0 is a legitimate ceiling and must
+        # not be mistaken for "unset".
+        "max_budget": (
+            info.get("max_budget")
+            if info.get("max_budget") is not None
+            else bt.get("max_budget")
+        ),
         "budget_duration": bt.get("budget_duration", info.get("budget_duration")),
         "budget_reset_at": bt.get("budget_reset_at", info.get("budget_reset_at")),
         "budget_id": info.get("budget_id") or bt.get("budget_id"),
     }
-
-
-def litellm_add_budget(budget_id: str, credit: float) -> tuple[bool, str]:
-    """Raise a budget's ceiling by `credit`: read the current value, then set the sum.
-
-    `credit` may be negative. This is the fallback path -- the normal path
-    recomputes the whole ceiling from the ledger (plan baseline + unconsumed
-    top-up credit), which is robust to a stale ceiling.
-    """
-    status, resp = http_json(
-        "POST", f"{LITELLM_URL}/budget/info", {"budgets": [budget_id]}, litellm_headers()
-    )
-    if status != 200 or not isinstance(resp, list) or not resp:
-        return False, f"budget/info http={status} {str(resp)[:160]}"
-    current = resp[0].get("max_budget")
-    if current is None:
-        return False, f"budget {budget_id} has no max_budget to add to"
-    target = max(0.0, round(float(current) + float(credit), 6))
-    return litellm_set_budget(budget_id, target)
 
 
 def litellm_reset_spend(key_ref: str, reset_to: float = 0.0) -> tuple[bool, str]:
@@ -820,7 +849,9 @@ def reconcile_budgets(conn: sqlite3.Connection) -> int:
         desired = topup_ceiling(acct, plan_budget)
         current = st.get("max_budget")
         if current is None or abs(float(current) - desired) > 1e-9:
-            ok2, msg = litellm_set_budget(acct["budget_id"], desired)
+            ok2, msg = litellm_set_budget(
+                acct["budget_id"], desired, acct["litellm_key_hash"] or ""
+            )
             if ok2:
                 changed += 1
                 LOG.info(
@@ -995,7 +1026,9 @@ def process_event(conn: sqlite3.Connection, row: sqlite3.Row) -> tuple[str, str]
                 "SELECT * FROM accounts WHERE account_id=?", (account_id,)
             ).fetchone()
             ceiling = topup_ceiling(acct, plan_budget)
-            ok, msg = litellm_set_budget(budget_id, ceiling)
+            ok, msg = litellm_set_budget(
+                budget_id, ceiling, acct["litellm_key_hash"] or ""
+            )
             # A top-up raises the ceiling ONLY. It deliberately does NOT clear
             # accrued spend -- that would hand the customer a free period every
             # time they reload, and would let a top-up buy more than it paid for.
@@ -1026,7 +1059,9 @@ def process_event(conn: sqlite3.Connection, row: sqlite3.Row) -> tuple[str, str]
         # setting it to the plan alone is what silently erased a customer's
         # top-up on the next subscription payment.
         amount = topup_ceiling(acct, plan_budget)
-        ok, msg = litellm_set_budget(budget_id, amount)
+        ok, msg = litellm_set_budget(
+            budget_id, amount, acct["litellm_key_hash"] or ""
+        )
 
         # Bug #156 follow-up: raising the ceiling is NOT enough. LiteLLM blocks on
         # `spend >= max_budget`, and /budget/update has no `spend` field, so a
@@ -1056,7 +1091,7 @@ def process_event(conn: sqlite3.Connection, row: sqlite3.Row) -> tuple[str, str]
     # cancellation
     prow = conn.execute("SELECT * FROM plans WHERE plan_name=?", (acct["plan"],)).fetchone()
     amount = float(prow["on_cancel_budget"]) if prow else 0.0
-    ok, msg = litellm_set_budget(budget_id, amount)
+    ok, msg = litellm_set_budget(budget_id, amount, acct["litellm_key_hash"] or "")
     return ("done" if ok else "failed"), f"cancel -> {msg}"
 
 

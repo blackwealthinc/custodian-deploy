@@ -172,6 +172,36 @@ The sweep samples `last_spend` between runs, so a burst inside the final samplin
 window **under**-counts consumption and leaves the customer a little extra credit.
 It fails in the customer's favour, never the other way round.
 
+### Where the ceiling actually lives — ON THE KEY (corrected 2026-09-29)
+
+The ceiling **must** be written where LiteLLM enforces it, and that is not
+always the budget object. Verified live against v1.95.0 with an A/B/C probe:
+
+| Key shape | Enforced ceiling |
+|---|---|
+| `budget_id` linked, key has **no** own `max_budget` | the **budget object's** value — `LiteLLM_VerificationTokenView.__init__` copies `litellm_budget_table_*` onto the token, but **only `if current is None`** |
+| key carries its **own** `max_budget` (with or without a `budget_id`) | the **key's** value; the linked budget object is **ignored** |
+
+`setup-custodian-factory.sh:39` creates customer keys **with their own
+`max_budget`**, and nothing in the repo links them to a budget object. So the
+original `/budget/update`-only write moved an object that **no customer key
+reads** — a top-up would have silently done nothing for a real customer while
+passing every test on the demo key (which was hand-linked to a budget object).
+
+The bridge therefore writes the ceiling **on the key** via
+`POST /key/update {"key": <sha256 hash>, "max_budget": N}`, which is
+authoritative for both shapes. Two properties make that safe:
+
+- `/key/update` accepts our stored **sha256 hash** (`_hash_token_if_needed`
+  hashes only `sk-`-prefixed values), so the plaintext key is never needed;
+- it uses `model_dump(exclude_unset=True)`, so the `budget_duration` set at
+  provisioning time is **not** clobbered.
+
+The budget-object write is retained only as the fallback for an account with no
+key hash. Reads use the same priority (`litellm_key_state.max_budget`: the key's
+value when set — `is not None`, so a legitimate `0.0` counts — else the object's),
+so the value the sweep compares against is the value the enforcer uses.
+
 ### Selling one
 
 ```bash
