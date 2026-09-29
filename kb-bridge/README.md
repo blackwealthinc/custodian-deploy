@@ -82,8 +82,43 @@ It prints the exact callback URL to register; the bare token is also at `/opt/kb
 sudo python3 /opt/kb-bridge/kb_bridge.py status    # queue depth, config sanity, errors
 sudo python3 /opt/kb-bridge/kb_bridge.py plan  --plan-name basic --max-budget 5.0
 sudo python3 /opt/kb-bridge/kb_bridge.py map   --account-id <killbill-account-uuid> \
-        --budget-id <litellm-budget-id> --plan basic
+        --key-hash <sk-...|sha256> --plan basic --rail card
 sudo journalctl -u kb-bridge-worker -f
+```
+
+### Mapping an account (2026-09-29)
+
+`--key-hash` is the field that must be present. Without it the ceiling cannot be written
+and `spend` cannot be reset when the customer pays — the event says
+`SPEND NOT RESET (no litellm_key_hash …)` rather than failing quietly.
+
+**`--budget-id` is OPTIONAL and normally omitted.** `setup-custodian-factory.sh` provisions
+keys that carry their own `max_budget` and `budget_duration: 1mo` and are linked to **no
+budget object at all**:
+
+```
+max_budget: 5.0     budget_duration: 1mo     budget_id: None     litellm_budget_table: None
+```
+
+Such a key is fully supported: the ceiling is written on the **key** and it resets monthly
+via `reset_budget_for_litellm_keys()` (keyed on the key's own `budget_reset_at`). The
+budget object is only the legacy fallback for an account with **no** key hash. Do not
+"repair" a missing budget object.
+
+`--rail` decides what counts as money:
+
+| rail | behaviour |
+|---|---|
+| `card` (default) | Kill Bill auto-charges the saved **Stripe** method; a `__EXTERNAL_PAYMENT__` bookkeeping payment is **refused** |
+| `manual` | crypto/offline, where a hand-recorded payment *is* the confirmation; the account must also carry the **`AUTO_PAY_OFF`** tag or the engine invents a payment |
+
+**Before adding a customer, confirm they can reset.** A key with no budget object *and* no
+its own `budget_duration` is on neither reset path and becomes a permanent cap:
+
+```sql
+-- LiteLLM DB — expect ZERO rows
+SELECT key_alias, budget_id, budget_duration FROM "LiteLLM_VerificationToken"
+WHERE budget_id IS NULL AND budget_duration IS NULL;
 ```
 
 Register the callback once per tenant (needs that tenant's API credentials):
