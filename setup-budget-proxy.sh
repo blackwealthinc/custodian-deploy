@@ -19,8 +19,8 @@
 #   DB_PASSWORD           — PostgreSQL password (reads from .db-credentials if not set)
 #
 # One-liner:
-#   export DEEPSEEK_API_KEY=*** \
-#   export BUDGET_PROXY_DOMAIN=*** && \
+#   export DEEPSEEK_API_KEY=<your-deepseek-key> \
+#   export BUDGET_PROXY_DOMAIN=<your-domain> && \
 #     curl -s https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/setup-budget-proxy.sh | sudo -E bash
 #
 # Architecture: custodian-architecture-budget-proxy-scaling.md § 2-3
@@ -49,19 +49,19 @@ fi
 # ── Validate Required Input ──
 if [ -z "${DEEPSEEK_API_KEY:-}" ]; then
     log_error "DEEPSEEK_API_KEY is required but not set"
-    echo "  Usage: export DEEPSEEK_API_KEY=*** && ... | sudo -E bash"
+    echo "  Usage: export DEEPSEEK_API_KEY=<your-deepseek-key> && curl -s ... | sudo -E bash"
     exit 1
 fi
 
 if [ -z "${DASHSCOPE_API_KEY:-}" ]; then
     log_error "DASHSCOPE_API_KEY is required but not set"
-    echo "  Usage: export DASHSCOPE_API_KEY=*** && ... | sudo -E bash"
+    echo "  Usage: export DASHSCOPE_API_KEY=<your-dashscope-key> && curl -s ... | sudo -E bash"
     exit 1
 fi
 
 if [ -z "${OPENAI_API_KEY:-}" ]; then
     log_error "OPENAI_API_KEY is required but not set"
-    echo "  Usage: export OPENAI_API_KEY=*** && ... | sudo -E bash"
+    echo "  Usage: export OPENAI_API_KEY=<your-openai-key> && curl -s ... | sudo -E bash"
     exit 1
 fi
 

@@ -43,7 +43,7 @@ curl -s https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/s
 ## STEP 2 — Budget Proxy (VM 205)
 
 ```bash
-export DEEPSEEK_API_KEY=*** && \
+export DEEPSEEK_API_KEY=<your-deepseek-key> && \
   curl -s https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/setup-budget-proxy.sh | sudo -E bash
 ```
 
@@ -59,7 +59,7 @@ export DEEPSEEK_API_KEY=*** && \
 ```bash
 # Generate a key (run on VM205 after setup-budget-proxy.sh)
 curl -s -X POST http://localhost:4000/key/generate \
-  -H "Authorization: Bearer *** \
+  -H "Authorization: Bearer <your-master-key>" \
   -H "Content-Type: application/json" \
   -d '{"key_alias": "admin", "models": ["deepseek-v4-pro"], "max_budget": 100, "budget_duration": "1mo"}'
 ```
@@ -74,7 +74,7 @@ The response contains `"key": "sk-..."` — this is your `CUSTOMER_API_KEY`.
 GPT Researcher adds autonomous deep research — multi-step web scraping with cited reports.
 
 ```bash
-export CUSTOMER_API_KEY=*** && \
+export CUSTOMER_API_KEY=<customer-virtual-key> && \
 export BUDGET_PROXY_URL=http://100.64.0.1:4000/v1 && \
   curl -s https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/setup-deep-research.sh | sudo -E bash
 ```
@@ -88,7 +88,7 @@ export BUDGET_PROXY_URL=http://100.64.0.1:4000/v1 && \
 The default CUSTOMER_ID is `custodian`. Default ports: Hermes 8642, OpenWebUI 3000.
 
 ```bash
-export CUSTOMER_API_KEY=*** && \
+export CUSTOMER_API_KEY=<customer-virtual-key> && \
 export BUDGET_PROXY_URL=http://100.64.0.1:4000/v1 && \
   curl -s https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/setup-custodian-factory.sh | sudo -E bash
 ```
@@ -110,7 +110,7 @@ export BUDGET_PROXY_URL=http://100.64.0.1:4000/v1 && \
 
 ```bash
 # Customer 2 (William)
-export CUSTOMER_API_KEY=*** && \
+export CUSTOMER_API_KEY=<customer-virtual-key> && \
 export BUDGET_PROXY_URL=http://100.64.0.1:4000/v1 && \
 export CUSTOMER_ID=william && \
 export PORT=8643 && \
@@ -118,7 +118,7 @@ export WEBUI_PORT=3001 && \
   curl -s https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/setup-custodian-factory.sh | sudo -E bash
 
 # Customer 3 (Gabriel)
-export CUSTOMER_API_KEY=*** && \
+export CUSTOMER_API_KEY=<customer-virtual-key> && \
 export BUDGET_PROXY_URL=http://100.64.0.1:4000/v1 && \
 export CUSTOMER_ID=gabriel && \
 export PORT=8644 && \

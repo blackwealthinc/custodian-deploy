@@ -3,7 +3,7 @@
 # Run ONCE per physical server. Auto-connects to Budget Proxy + SearXNG.
 #
 # One-liner:
-#   CUSTOMER_API_KEY=*** \
+#   CUSTOMER_API_KEY=<customer-virtual-key> \
 #     BUDGET_PROXY_URL=http://100.64.0.1:4000/v1 \
 #     curl -s https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/setup-deep-research.sh | sudo -E bash
 
@@ -21,7 +21,7 @@ log_info()  { echo -e "  -> $1"; }
 # Required: CUSTOMER_API_KEY
 if [ -z "${CUSTOMER_API_KEY:-}" ]; then
   echo "ERROR: CUSTOMER_API_KEY is required (your LiteLLM virtual key from Budget Proxy)"
-  echo "Usage: export CUSTOMER_API_KEY=*** && curl ... | sudo -E bash"
+  echo "Usage: export CUSTOMER_API_KEY=<customer-virtual-key> && curl ... | sudo -E bash"
   exit 1
 fi
 

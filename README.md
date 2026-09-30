@@ -27,11 +27,11 @@ Always run in this order. Never skip. Never reverse.
 curl -s https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/setup-database.sh | sudo -E bash
 
 # STEP 2 — Budget Proxy (requires DeepSeek key and domain)
-export DEEPSEEK_API_KEY=*** && \
+export DEEPSEEK_API_KEY=<your-...key> && \
   curl -s https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/setup-budget-proxy.sh | sudo -E bash
 
 # STEP 3 — Customer Server (requires Budget Proxy URL and customer virtual key)
-export CUSTOMER_API_KEY=*** \
+export CUSTOMER_API_KEY=<cust...-key> \
 export BUDGET_PROXY_URL=https://budget.ns1net.com/v1 && \
   curl -s https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/setup-custodian-factory.sh | sudo -E bash
 ```
@@ -41,11 +41,11 @@ export BUDGET_PROXY_URL=https://budget.ns1net.com/v1 && \
 ```bash
 # First customer
 PORT=8601 WEBUI_PORT=3001 CUSTOMER_ID=maria \
-  CUSTOMER_API_KEY=*** docker compose -p maria -f docker-compose.custodian-factory.yml up -d
+  CUSTOMER_API_KEY=<cust...-key> docker compose -p maria -f docker-compose.custodian-factory.yml up -d
 
 # Second customer (does NOT touch first)
 PORT=8602 WEBUI_PORT=3002 CUSTOMER_ID=john \
-  CUSTOMER_API_KEY=*** docker compose -p john -f docker-compose.custodian-factory.yml up -d
+  CUSTOMER_API_KEY=<cust...-key> docker compose -p john -f docker-compose.custodian-factory.yml up -d
 ```
 
 ## Requirements

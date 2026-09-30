@@ -3,7 +3,7 @@
 # Routes ALL AI requests through Budget Proxy (LiteLLM)
 #
 # One-liner:
-#   export CUSTOMER_API_KEY=*** BUDGET_PROXY_URL=https://budget.ns1net.com/v1 && curl -s https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/setup-custodian-factory.sh | sudo -E bash
+#   export CUSTOMER_API_KEY=<customer-virtual-key> BUDGET_PROXY_URL=https://budget.ns1net.com/v1 && curl -s https://raw.githubusercontent.com/blackwealthinc/custodian-deploy/main/setup-custodian-factory.sh | sudo -E bash
 
 set -euo pipefail
 
