@@ -1148,6 +1148,38 @@ def payment_id_of(payload: dict) -> str:
     return ""
 
 
+def transition_identity_of(payload: dict) -> str:
+    """Identity of a blocking-state transition. Bug #166.
+
+    A `BLOCKING_STATE` event carries **no `paymentId`**, so for one account the
+    tuple (eventType, objectType, objectId, accountId) is IDENTICAL for every
+    transition. The cut and the restore therefore hashed to the SAME idem key:
+    the restore was ACKed as `duplicate` and silently discarded, and the cut-off
+    could never be undone. Proven live 2026-09-30 -- event 383 cut the key, and
+    the `__KILLBILL__CLEAR__OVERDUE_STATE__` transition was received with
+    `fresh=False` and dropped. This is Bug #149's exact failure mode, one event
+    class further out; fixing #149 did not cover it.
+
+    The state NAME alone is not enough: a customer who is cut, pays, and then
+    goes overdue again emits `CUST_OD2_BLOCKED` a second time, which would collide
+    with the first cut and let them keep service while unpaid. `effectiveDate`
+    makes every transition distinct, while a re-delivery of the SAME transition
+    still carries the same effectiveDate and still dedupes.
+    """
+    meta = payload.get("metaData")
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except (json.JSONDecodeError, ValueError):
+            return ""
+    if not isinstance(meta, dict):
+        return ""
+    state = str(meta.get("stateName") or "").strip()
+    if not state:
+        return ""
+    return f"{state}@{str(meta.get('effectiveDate') or '').strip()}"
+
+
 def idem_key_of(payload: dict, raw: bytes, source: str = "webhook") -> str:
     # tenantId is DELIBERATELY excluded. The sweep and the webhook describe the
     # same underlying payment but cannot know the same tenantId (the sweep runs
@@ -1176,6 +1208,14 @@ def idem_key_of(payload: dict, raw: bytes, source: str = "webhook") -> str:
         str(payload.get("accountId") or ""),
         payment_id_of(payload),
     ]
+    # Bug #166: a blocking transition has no paymentId, so without this the cut and
+    # the restore hash to the same key and the restore is discarded as a duplicate.
+    # DELIBERATELY conditional -- every other event keeps the exact key it had, so
+    # no existing dedup row changes meaning. If the transition cannot be identified
+    # the raw body is used instead, which still dedupes a re-delivery of the same
+    # bytes while never collapsing two DIFFERENT transitions.
+    if str(payload.get("eventType") or "").upper() == "BLOCKING_STATE":
+        parts.append(transition_identity_of(payload) or hashlib.sha256(raw).hexdigest())
     if all(not p for p in parts):
         return hashlib.sha256(raw).hexdigest()
     return hashlib.sha256("|".join(parts).encode()).hexdigest()

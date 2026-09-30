@@ -145,6 +145,56 @@ status, msg = B.process_event(  # type: ignore[arg-type]
         None, {"event_type": "SOME_OTHER_EVENT", "account_id": ACCT, "payload": "{}"})
 check("unrelated event -> still skipped", status, "skipped")
 
+# --- Bug #166: the idem key must distinguish a cut from a restore --------------
+# Real transitions from the live box, 2026-09-30: OD2 at 19:27:45 then CLEAR at
+# 19:28:36. Both were received; the CLEAR one arrived `fresh=False` and was
+# discarded, so the cut could never be undone.
+REAL_CUT = dict(REAL_BLOCKING_WARN, metaData=json.dumps({
+    "blockableId": ACCT, "service": "overdue-service",
+    "stateName": "CUST_OD2_BLOCKED", "blockingType": "ACCOUNT",
+    "effectiveDate": "2026-09-30T19:27:45.000Z",
+    "transitionedToBlockedEntitlement": True,
+}))
+REAL_CLEAR = dict(REAL_BLOCKING_WARN, metaData=json.dumps({
+    "blockableId": ACCT, "service": "overdue-service",
+    "stateName": "__KILLBILL__CLEAR__OVERDUE_STATE__", "blockingType": "ACCOUNT",
+    "effectiveDate": "2026-09-30T19:28:36.000Z",
+    "transitionedToUnblockedEntitlement": True,
+}))
+SECOND_CUT = dict(REAL_CUT, metaData=json.dumps({
+    "blockableId": ACCT, "service": "overdue-service",
+    "stateName": "CUST_OD2_BLOCKED", "blockingType": "ACCOUNT",
+    "effectiveDate": "2026-11-02T08:00:00.000Z",
+}))
+
+raw_cut = json.dumps(REAL_CUT).encode()
+k_cut = B.idem_key_of(REAL_CUT, raw_cut)
+k_clear = B.idem_key_of(REAL_CLEAR, json.dumps(REAL_CLEAR).encode())
+k_second = B.idem_key_of(SECOND_CUT, json.dumps(SECOND_CUT).encode())
+
+check("#166 cut and CLEAR -> DIFFERENT idem keys", k_cut != k_clear, True)
+check("#166 a SECOND cut -> DIFFERENT key (no silent re-cut)",
+      k_cut != k_second, True)
+check("#166 re-delivery of the SAME cut -> same key (still dedupes)",
+      B.idem_key_of(REAL_CUT, raw_cut), k_cut)
+
+# regression guard: the fix is conditional, so no OTHER event's key may change
+want = B.hashlib.sha256("|".join([
+    "INVOICE_PAYMENT_SUCCESS", "INVOICE", "inv-1", ACCT, "pay-1",
+]).encode()).hexdigest()
+pay = {"eventType": "INVOICE_PAYMENT_SUCCESS", "objectType": "INVOICE",
+       "objectId": "inv-1", "accountId": ACCT,
+       "metaData": json.dumps({"paymentId": "pay-1"})}
+check("#166 payment event key UNCHANGED by the fix",
+      B.idem_key_of(pay, b"{}"), want)
+
+# and a BLOCKING_STATE with unparseable metaData must never collide either
+bad_a = {"eventType": "BLOCKING_STATE", "objectType": "ACCOUNT",
+         "objectId": ACCT, "accountId": ACCT, "metaData": "not json"}
+bad_b = dict(bad_a, metaData="also not json")
+check("#166 unidentifiable transitions -> DIFFERENT keys",
+      B.idem_key_of(bad_a, b"aaa") != B.idem_key_of(bad_b, b"bbb"), True)
+
 print()
 print("%d/%d passed" % (sum(results), len(results)))
 sys.exit(0 if all(results) else 1)
