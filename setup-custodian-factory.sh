@@ -26,6 +26,22 @@ log_ok "Working directory: $(pwd)"
 # Bug #47: All credential var references use indirection — GitHub filter corrupts literal KEY/API names
 _LMK_VN="LITELLM_MASTER""_KEY"
 _CAK_VN="CUSTOMER_""API_KEY"
+
+# Configure these BEFORE the auto-generate block below uses them. They used to be
+# defaulted further down -- AFTER that block -- which caused one real defect:
+#   * an unset BUDGET_PROXY_URL aborted the script with "unbound variable" (set -u),
+#     so the documented default below was unreachable dead code. Reproduced against
+#     the previous revision: the auto-generate path died before reaching curl.
+#     (CUSTOMER_ID is NOT affected -- line 39's inline `${CUSTOMER_ID:-custodian}`
+#     already used the identical default, so the value was the same either way.
+#     An earlier comment here claimed a silent alias collision; that was wrong.)
+CUSTOMER_ID="${CUSTOMER_ID:-custodian}"
+BUDGET_PROXY_URL="${BUDGET_PROXY_URL:-https://budget.ns1net.com/v1}"
+# NOTE: this is the LiteLLM key's ceiling. The bridge's `plans` table is what the
+# monthly allowance actually is (`basic 5.0`), and the first payment event rewrites
+# this value -- see the hand-maintained-table item in the Phase 3 plan.
+MAX_BUDGET="${MAX_BUDGET:-100}"
+
 if [ -z "${!_CAK_VN:-}" ]; then
   if [ -z "${!_LMK_VN:-}" ]; then
     echo "ERROR: CUSTOMER_API_KEY or LITELLM_MASTER_KEY is required"
@@ -47,12 +63,10 @@ if [ -z "${!_CAK_VN:-}" ]; then
   export "${_CAK_VN}"
   log_ok "Virtual key generated: ${_RAW_KEY:0:16}..."
 fi
-# Configuration
-BUDGET_PROXY_URL="${BUDGET_PROXY_URL:-https://budget.ns1net.com/v1}"
+# Configuration  (CUSTOMER_ID / BUDGET_PROXY_URL / MAX_BUDGET are defaulted ABOVE,
+# immediately before the auto-generate block that needs them)
 PORT="${PORT:-8642}"
 WEBUI_PORT="${WEBUI_PORT:-3000}"
-CUSTOMER_ID="${CUSTOMER_ID:-custodian}"
-MAX_BUDGET="${MAX_BUDGET:-100}"
 
 # Reuse existing API_SERVER_KEY from WebUI database on re-runs (Bug #18 fix)
 # Without this, every re-run generates a new random key → Hermes gets new key
