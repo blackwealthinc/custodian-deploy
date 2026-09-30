@@ -268,6 +268,25 @@ confirmed at source in the plugin's `stripe-plugin-8.0.4` tag:
 That last point is why a top-up needs no checkout of its own: the external charge is
 committed, auto-pay collects it.
 
+### This path is proven, not theorised (2026-09-29)
+
+A Stripe **sandbox** can be provisioned with no authentication
+(`stripe sandbox create --from-git`) and it settles test cards through the **real
+gateway**, so the whole chain was exercised without a live card:
+
+```
+pi_3ULAn8CjK72m0IUz0ulEiRhI   succeeded   $11.50   off-session, confirmed
+event 372 INVOICE_PAYMENT_SUCCESS  done
+  top-up: paid 11.500000 of 11.500000 -> entitlement 10.000000; ceiling 15.000000
+```
+
+Step 2 above ran with the account on **`rail=card`** — the rail that *refuses* the
+bookkeeping plugin — which is the first time the guard has been exercised in the
+**positive** direction: a genuine gateway settlement was credited, an invented one was not.
+
+Still unproven: a **live-mode** charge (real money, then a refund), and whether an issuer
+that demands 3-D Secure will decline an unattended off-session renewal.
+
 ### The rail guard — a payment is not proof of money
 
 The same auto-pay reaches for Kill Bill's built-in **`__EXTERNAL_PAYMENT__`** plugin
