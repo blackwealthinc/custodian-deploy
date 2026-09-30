@@ -100,7 +100,7 @@ POST `<overdueConfig><accountOverdueStates/></overdueConfig>` — with no states
 
 ---
 
-## 3. THE BRIDGE CHANGE (designed, not yet applied)
+## 3. THE BRIDGE CHANGE — ✅ APPLIED + PROVEN 2026-09-30
 
 Dispatch point — `kb_bridge.py:571`:
 ```python
@@ -113,19 +113,58 @@ if etype != ACTION_PAYMENT and etype not in ACTION_CANCEL:
 3. Give it its own `killbill_verify_*` corroboration, like payment and cancel have: read the engine back via `GET /1.0/kb/accounts/{id}/overdue` and require a **non-CLEAR** state before acting. A block is destructive; a request bearing the callback token must not be able to zero a paying customer.
 4. Distinguish the **state name**: `CUST_OD1_WARNING` → **no budget change**; `CUST_OD2_BLOCKED` / `CUST_OD3_CANCEL` → zero.
 
-**⚠️ Not yet verified:** the exact `eventType` string the webhook delivers for a blocking transition. The earlier research names `BLOCKING_STATE` and `OVERDUE_CHANGE`; the emitted internal event is a `BlockingTransitionInternalEvent` raised by the entitlement DAO. **This must be observed empirically, not assumed.** See §4 step 1.
+**✅ Resolved:** the `eventType` is **`BLOCKING_STATE`** (observed live, not assumed), and its
+`metaData` arrives as a JSON **string** that must be parsed a second time. `OVERDUE_CHANGE` also
+fires but carries `metaData: null`, so it carries nothing to act on and is deliberately skipped.
+
+**⚠️ Correction to step 1-2 above:** the stub as first drafted zeroed a *budget*. That was wrong for
+this codebase — the ceiling lives **on the key**, and a budget write is cached for ~60 s, so a
+time-critical cut must use **`/key/block`** (which invalidates the cache explicitly → immediate).
+The section-2 reasoning stands; only the mechanism moved.
 
 ---
 
-## 4. THE TEST PLAN (and why it must be in this order)
+## 4. THE TEST PLAN — ✅ COMPLETE 2026-09-30 (results below)
 
-**Step 1 — observe the real event, with NO code change.** Upload a temporary config whose only state is `numberOfUnpaidInvoicesEqualsOrExceeds = 1`. Create a test account with an unpaid invoice. The bridge will log the arriving event as `skipped: not actionable: <REAL EVENT NAME>`. **That yields the exact string from the live system** — then restore the real ladder.
+> **RESULT.** All four steps ran live on `.104` + VM205. The mechanism is proven in **both**
+> directions, and the run found **Bug #166** — the restore signal was being deduplicated away, so
+> the cut-off could not be undone. See `research/custodian-bug-index.md` #166 / issue #154.
+>
+> **Method note (honest):** the *clock* was compressed, nothing else. The ladder's time unit floor is
+> DAYS and **no supported API can backdate `invoiceDate`** — verified in source:
+> `DefaultInvoiceService.createMigrationInvoice` also sets `invoiceDate = createdDate`, so the
+> `POST /invoices/migration` endpoint does not help either, and `requestedDate` on
+> `createExternalCharges` only sets **`targetDate`**, which `DefaultOverdueCondition` never reads.
+> So the real config was backed up and an **identical-structure** copy — same three states, same
+> conditions, same actions — was uploaded with **only the OD2 day threshold changed 14 → 0**. The
+> real engine, the real bus event, the real bridge, and the real LiteLLM key were all exercised; the
+> real ladder was restored immediately afterwards and verified.
 
-**Step 2 — apply the bridge change** using the observed name.
+**Step 1 — observe the real event, with NO code change.** *(done earlier, from the live DB)* The
+event name is **`BLOCKING_STATE`**, and its `metaData` is a JSON **string** carrying `stateName`. The
+earlier `skipped` rows were events 334/335/336.
 
-**Step 3 — prove the cut.** Watch `kb-cust-*` budget go to **0** and confirm a request is refused with `BudgetExceededError`.
+**Step 2 — apply the bridge change** using the observed name. `ACTION_BLOCK = ("BLOCKING_STATE",)`;
+`OVERDUE_CHANGE` carries `metaData: null` and is deliberately not actionable.
 
-**Step 4 — prove the restore.** Restore `max_budget` **and** confirm `KB_BUDGET_DURATION` is set, because `spend >= max_budget` will otherwise keep them blocked even after the budget is raised. **This is why Track 2 (cut-off) and Track 3 (Bug #156) must ship together** — a cut-off that cannot be undone is worse than no cut-off.
+**Step 3 — prove the cut.** ✅
+
+```
+event 383  BLOCKING_STATE  CUST_OD2_BLOCKED  -> cut-off: state=CUST_OD2_BLOCKED -> /key/block: ok
+key /key/info: blocked True
+real request:  http 401 "Authentication Error, Key is blocked."
+```
+
+**Step 4 — prove the restore.** ✅ *after* fixing #166
+
+```
+event 405  BLOCKING_STATE  __KILLBILL__CLEAR__OVERDUE_STATE__ -> restore -> /key/unblock: ok
+key /key/info: blocked False
+real request:  http 200
+```
+
+The same run also proved a **second** cut of the same account (event 401) still cuts, which is the
+case a `stateName`-only dedup fix would have broken.
 
 ---
 

@@ -488,6 +488,43 @@ That exercises the whole path: Kill Bill → `192.168.50.205:8555` → SQLite qu
 - **`useGlobalDefault` on tenant create** defaults to `false`, giving the tenant an explicit *empty* catalog (`catalogUserApi.createDefaultEmptyCatalog`). Uploading our own catalog works either way, so the default is the clean state.
 - Root API auth here is `admin:password` (shiro.ini: `admin = password, root`; role `root = *:*`). Our compose sets no auth config, so these are image defaults.
 
+## The cut-off (Phase 3) — LIVE and PROVEN in both directions
+
+*"So long as we can cut services when payment is missing that's all that matters"* —
+`features/domain-email-and-go-to-market-strategy.md` §2.8. The trigger is **"is the invoice paid"**,
+never *how* they paid, so this one path covers cards and crypto alike.
+
+The ladder is the policy (`kb-bridge/overdue-custodian.xml`, per tenant). The bridge only reacts:
+
+| Kill Bill state | When | Bridge action |
+|---|---|---|
+| `CUST_OD1_WARNING` | unpaid ≥ 7 d | **nothing cut** — notify only |
+| `CUST_OD2_BLOCKED` | unpaid ≥ 14 d | **cut** → `POST /key/block` |
+| `CUST_OD3_CANCEL` | unpaid ≥ 30 d | **cut** (the cancel arrives separately) |
+| `__KILLBILL__CLEAR__OVERDUE_STATE__` | balance cleared | **restore** → `POST /key/unblock` |
+
+**Why `/key/block` and not a budget write:** the ceiling lives on the key, and a budget change sits
+behind a ~60 s cache. `/key/block` calls `_delete_cache_key_object` explicitly, so the cut is
+**immediate**. `POST /key/unblock` is safe to call on a key that was never blocked (it only 404s if
+the key does not exist), which is why it is wired into **every** payment path and not just the ladder.
+
+**Fail-closed:** the cut is refused unless Kill Bill independently confirms the account still carries
+an unpaid invoice (`GET /invoices/search/balance[gt]=0` — verified live; `balance[gte]=0.01` returns a
+500 SQL error). A forged `BLOCKING_STATE` bearing only the callback token cannot cut a paying
+customer.
+
+**Proven live 2026-09-30** (`research/custodian-bug-index.md` #166):
+
+```
+event 383  CUST_OD2_BLOCKED                   -> /key/block: ok    request REFUSED 401
+event 405  __KILLBILL__CLEAR__OVERDUE_STATE__ -> /key/unblock: ok  request OK http 200
+```
+
+**Bug #166 caught by this test:** the restore was silently discarded. `idem_key_of()` rejected the
+`CLEAR` transition as a duplicate of the cut because a `BLOCKING_STATE` carries no `paymentId`, so all
+five key parts were identical. Fixed by adding `stateName@effectiveDate` — for `BLOCKING_STATE` only —
+so a repeat cut cannot collide with the first one either.
+
 ## Known gaps
 
 - **`SUBSCRIPTION_CHANGE` is not handled.** Deciding the new budget needs a subscription→plan lookup against Kill Bill. Until that exists a plan change leaves the budget at the old value until the next payment. It is marked `skipped` with an explicit reason rather than silently ignored.
@@ -496,9 +533,17 @@ That exercises the whole path: Kill Bill → `192.168.50.205:8555` → SQLite qu
 
 ## Still to do
 
-1. **Author and upload the Kill Bill catalog** — the tenant currently has an empty one, so no subscription or invoice can exist yet. Validate with `POST /1.0/kb/catalog/xml/validate` before uploading.
-2. **Set the real plan budgets** — the seeded `basic 5 / pro 20 / business 100` are placeholders, and `plans` maps a Kill Bill plan name to a dollar ceiling.
-3. **Map accounts** once accounts exist: `kb_bridge.py map --account-id <uuid> --budget-id <litellm-budget>`.
-4. **Firewall `:8555`.**
-5. **Decide `KB_BUDGET_DURATION`** (monthly reset) once pricing is settled.
+1. ~~Author and upload the Kill Bill catalog~~ — **done** (3 retail plans; the **licence plan is
+   still missing** — Model B needs two catalogs, ours = the licence, theirs = retail).
+2. **Set the real plan budgets** — the seeded `basic 5 / pro 20 / business 100` are placeholders. Note
+   `plans` maps a Kill Bill plan name to a dollar ceiling, and a `map` call leaves `plan_budget` NULL
+   on purpose: the first use backfills it from `plans` (`account_plan_budget`), so `plans` stays the
+   single source of truth.
+3. **Register each provisioned customer:** `kb_bridge.py map --account-id <uuid> --plan <plan>
+   --rail card --key-hash <sk-…>`. `run_custodian_factory.sh` creates the key but does **not** write
+   this mapping — the operator step is the documented path (no write-capable HTTP surface until
+   Contabo automation lands).
+4. **Firewall `:8555`.** *(done — `kb-bridge-firewall.service`, REJECT not DROP)*
+5. ~~Decide `KB_BUDGET_DURATION`~~ — **`1mo`** (== `30d`; both snap to the 1st).
 6. **Add the per-tenant credential model** before onboarding a second reseller.
+7. **Align the two period clocks** (subscription start day = the 1st) before charging anyone.
