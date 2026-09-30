@@ -44,6 +44,31 @@ curl -s -u admin:password \
 
 Then swap `/xml/validate` for `/xml` to upload (expect `201`).
 
+### ✅ Use the script, not the raw curl
+
+The manual commands above are shown for understanding only. **The supported path is
+`catalog/upload-catalog.sh`**, because the manual path uploads the file **verbatim** — and the file's
+`effectiveDate` is `2026-01-01`, which is *in the past* and therefore reproduces bug #167 on any
+tenant created after that date (i.e. every reseller tenant). The script stamps the date instead:
+
+```bash
+# Run on VM205 -- the only host holding the KB tenant plaintext secret.
+# Export the tenant values from /opt/kb-bridge/kb-bridge.env first, then:
+./catalog/upload-catalog.sh --kb-url http://192.168.50.104:8080 --dry-run   # validate only
+./catalog/upload-catalog.sh --kb-url http://192.168.50.104:8080            # upload + verify
+```
+
+It refuses to upload unless **all** of these hold, so it cannot repeat the mistakes already made once:
+
+* the stamped XML is **well-formed** (strict `expat` parse — a `200` is not a parse check)
+* the validator's **body** has an **empty** `catalogValidationErrors` list (**HTTP 200 with errors in
+  the body means INVALID**)
+* the upload returns `201`
+* `availableBasePlans` is **non-empty** afterwards — i.e. the stamped date actually outranked the
+  tenant's auto-created empty default on *that* tenant
+
+Run it from **VM205** (the only host holding the KB tenant plaintext secret).
+
 ## Verifying it took
 
 ```bash
