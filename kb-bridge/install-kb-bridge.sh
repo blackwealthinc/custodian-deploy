@@ -73,7 +73,7 @@ KB_RECV_SLOT_WAIT_SECONDS=0.15
 # --- reconciliation sweep ---------------------------------------------------
 # Bug #157: enumeration is the documented balance search, so this is a PAGE
 # budget (20 x 200 = 4,000 invoices per run), not an invoice-number budget.
-# Reaching the cap logs `sweep INCOMPLETE ... Coverage was NOT complete`.
+# Reaching the cap logs "sweep INCOMPLETE ... Coverage was NOT complete".
 KB_SWEEP_PAGE_SIZE=200
 KB_SWEEP_MAX_PAGES=20
 KB_SWEEP_INTERVAL_SECONDS=900

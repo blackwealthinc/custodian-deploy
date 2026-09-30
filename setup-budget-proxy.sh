@@ -180,9 +180,9 @@ model_list:
   # COST RATES ARE PINNED EXPLICITLY (Phase 1, 2026-09-28).
   # Why: without explicit cost fields LiteLLM resolves each model's price from its
   # remote price map (model_prices_and_context_window.json), which it fetches from
-  # GitHub at startup. That map has drifted, and our `deepseek-v4-pro` alias once
-  # resolved to *Tencent's hosted-DeepSeek* entry ($0.435/M in, $0.87/M out)
-  # instead of DeepSeek's own ($1.32/M in, $3.96/M out) - under-metering our real
+  # GitHub at startup. That map has drifted, and our 'deepseek-v4-pro' alias once
+  # resolved to *Tencent's hosted-DeepSeek* entry (0.435/M in, 0.87/M out)
+  # instead of DeepSeek's own (1.32/M in, 3.96/M out) - under-metering our real
   # cost by ~3x. Pinning bypasses the lookup entirely.
   # Values below = DeepSeek official rate card, PEAK column (conservative: never
   # under-charges). Source: https://api-docs.deepseek.com/quick_start/pricing
