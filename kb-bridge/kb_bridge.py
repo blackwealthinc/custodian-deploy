@@ -184,6 +184,10 @@ SWEEP_MAX_PAGES = int(cfg("KB_SWEEP_MAX_PAGES", "20"))
 # _sweep_consider_invoice (needs status COMMITTED + a SUCCESS PURCHASE payment),
 # so the superset costs a little work and cannot produce a false grant.
 SWEEP_BALANCE_QUERY = "_q%3D1%26balance%5Blte%5D%3D0"
+# The INVERSE of the sweep query: invoices that still carry a balance, i.e. unpaid.
+# Used to corroborate a cut-off before acting on it. `gt` is the operator that
+# works on 0.24.21 -- `gte` returns a 500 SQL error. Both verified live.
+UNPAID_BALANCE_QUERY = "_q%3D1%26balance%5Bgt%5D%3D0"
 
 # --- receiver hardening ---------------------------------------------------- #
 # The receiver must NEVER park a Kill Bill event-bus thread. Kill Bill's shipped
@@ -244,6 +248,42 @@ BOOKKEEPING_PLUGIN = "__EXTERNAL_PAYMENT__"
 # Minimum top-up, in TOKENS (the amount credited), per the build plan:
 # "one-time, min $10, no max". The charge is 1.15x this.
 MIN_TOPUP_TOKENS = 10.0
+
+# --------------------------------------------------------------------------- #
+# Phase 3 — the cut-off (Bug #154 / GitHub #142)
+# --------------------------------------------------------------------------- #
+# THE HARD REQUIREMENT (Neo, 2026-09-22, domain-email-and-go-to-market-strategy.md
+# §2.8): "So long as we can cut services when payment is missing that's all that
+# matters. From both debit/credit AND crypto." A gate, not a preference.
+#
+# The trigger is "is the invoice paid", never "how did they pay", so ONE mechanism
+# covers cards AND crypto.
+#
+# Kill Bill's Overdue System owns the POLICY (the ladder is configured per tenant
+# from kb-bridge/overdue-custodian.xml); the bridge only reacts to the resulting
+# state change. The rule therefore lives in ONE place, not two.
+#
+# These are OUR state names, from that config -- not invented here:
+#   CUST_OD1_WARNING  day 7+   blockChanges only, entitlement NOT disabled
+#   CUST_OD2_BLOCKED  day 14+  disableEntitlement  -> kill the AI budget
+#   CUST_OD3_CANCEL   day 30+  disableEntitlement + END_OF_TERM cancel
+#   CLEAR             synthesised internally once nothing matches (i.e. they paid)
+#
+# Verified from the REAL event payloads captured live on VM205 (events 335/336):
+#   {"eventType":"BLOCKING_STATE","accountId":"…","objectType":"ACCOUNT",
+#    "objectId":"…","metaData":"{\"blockableId\":\"…\",\"service\":\"overdue-service\",
+#    \"stateName\":\"CUST_OD1_WARNING\",\"blockingType\":\"ACCOUNT\",…}"}
+# NOTE: `metaData` arrives as a JSON **STRING**, not an object -- it must be parsed
+# a second time. That is the single easiest thing to get wrong here.
+ACTION_BLOCK = ("BLOCKING_STATE",)
+OVERDUE_WARN_STATE = "CUST_OD1_WARNING"
+OVERDUE_BLOCK_STATES = ("CUST_OD2_BLOCKED", "CUST_OD3_CANCEL")
+OVERDUE_CLEAR_STATE = "CLEAR"
+
+# A failed payment is RECORDED, never acted on. The dunning policy belongs to the
+# overdue ladder above (OD1 warn -> OD2 cut -> OD3 cancel), so the bridge must not
+# invent a second one. Bug #154's entry says exactly this.
+ACTION_PAYMENT_FAILED = "INVOICE_PAYMENT_FAILED"
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -630,6 +670,71 @@ def litellm_reset_spend(key_ref: str, reset_to: float = 0.0) -> tuple[bool, str]
             f"spend reset {resp.get('previous_spend')} -> {resp.get('spend')}"
         )
     return False, f"key/reset_spend http={status} {str(resp)[:200]}"
+
+
+def litellm_set_blocked(key_ref: str, blocked: bool) -> tuple[bool, str]:
+    """Block or unblock a customer's key. Returns (ok, message).
+
+    Phase 3 cut-off. `POST /key/block` and `/key/unblock` both take
+    `{"key": <sk-... or sha256 hex>}`, so the stored hash is sufficient and the
+    plaintext key is never needed.
+
+    WHY THIS AND NOT A CEILING CHANGE: the source (v1.95.0
+    key_management_endpoints.py:6029-6039) writes `blocked: True` and then calls
+    `_delete_cache_key_object(...)`, explicitly invalidating the key cache. The
+    change therefore takes effect on the NEXT request. A ceiling edit does not --
+    the proxy caches a key's budget for up to 60 s, which is why the cut-off must
+    not be expressed as `max_budget = 0`.
+
+    It is also reversible in one call, which is what "restore when they pay" needs.
+    """
+    if not key_ref:
+        return False, "no key reference for block/unblock"
+    route = "/key/block" if blocked else "/key/unblock"
+    status, resp = http_json(
+        "POST", f"{LITELLM_URL}{route}", {"key": key_ref}, litellm_headers()
+    )
+    if status == 200:
+        return True, f"{route}: ok"
+    return False, f"{route} http={status} {str(resp)[:200]}"
+
+
+def killbill_verify_account_overdue(account_id: str) -> tuple[bool, str]:
+    """Is this account genuinely carrying an unpaid invoice? Fail closed.
+
+    The cut-off is the most damaging thing this bridge can do, so it gets the same
+    corroboration a payment or a cancellation gets (Bug #153's principle: the
+    callback path token is a noise filter, not authentication -- `BLOCKING_STATE`
+    arrives on that same unauthenticated path).
+
+    Corroborating the *reason* beats reading back the state: if no unpaid invoice
+    exists there is nothing to cut for, and the event is refused.
+
+    Syntax verified LIVE against KB 0.24.21, not assumed:
+      `balance[gt]=0`      -> 200, the unpaid invoices
+      `balance[lte]=0`     -> 200, the settled ones  (already used by the sweep)
+      `balance[gte]=0.01`  -> 500, java.sql.SQLSyntaxErrorException -- NOT supported
+    """
+    if not killbill_configured():
+        return False, "killbill credentials not configured (fail-closed)"
+    if not account_id:
+        return False, "event carried no accountId"
+
+    url = (
+        f"{KILLBILL_URL}/1.0/kb/invoices/search/{UNPAID_BALANCE_QUERY}"
+        "?offset=0&limit=200"
+    )
+    status, resp = http_json("GET", url, None, killbill_headers())
+    if status != 200 or not isinstance(resp, list):
+        return False, f"unpaid-invoice search http={status} {str(resp)[:160]}"
+
+    mine = [i for i in resp if (i.get("accountId") or "") == account_id]
+    if not mine:
+        return False, "no unpaid invoice for this account -- refusing to cut"
+    total = sum(float(i.get("balance") or 0.0) for i in mine)
+    if total <= 0:
+        return False, "unpaid invoices carry no balance -- refusing to cut"
+    return True, f"verified: {len(mine)} unpaid invoice(s), balance {total:.2f}"
 
 
 def killbill_headers() -> dict:
@@ -1099,6 +1204,89 @@ def enqueue(conn: sqlite3.Connection, payload: dict, raw: bytes, source: str = "
         return False  # duplicate -- already queued
 
 
+def handle_blocking_state(
+    acct: sqlite3.Row, row: sqlite3.Row, account_id: str
+) -> tuple[str, str]:
+    """React to a Kill Bill overdue state change. Returns (new_status, message).
+
+    THE HARD REQUIREMENT (domain-email-and-go-to-market-strategy.md §2.8): "So long
+    as we can cut services when payment is missing that's all that matters. From
+    both debit/credit AND crypto." The trigger is "is the invoice paid", never "how
+    did they pay", so this ONE path covers cards and crypto alike.
+
+    The ladder is the policy (kb-bridge/overdue-custodian.xml, per tenant):
+
+      CUST_OD1_WARNING   day 7+   blockChanges only    -> NOTHING is cut
+      CUST_OD2_BLOCKED   day 14+  disableEntitlement   -> CUT
+      CUST_OD3_CANCEL    day 30+  disableEntitlement   -> CUT (cancel arrives separately)
+      CLEAR              synthesised once nothing matches -> RESTORE
+
+    `CLEAR` is not in the config: Kill Bill synthesises it, which is how "they
+    paid" is signalled back. So a restore costs nothing extra here.
+    """
+    key_hash = (acct["litellm_key_hash"] or "").strip()
+    if not key_hash:
+        # Cannot act either way. Do not retry forever hoping a hash appears -- but
+        # say so loudly, because this account can be neither cut nor restored.
+        return "done", (
+            f"BLOCKING_STATE for {account_id} but the mapping has no "
+            "litellm_key_hash - cannot block or unblock the key"
+        )
+
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except (TypeError, ValueError):
+        return "failed", "BLOCKING_STATE payload is not JSON"
+
+    # metaData arrives as a JSON **STRING**, not an object -- verified against the
+    # real live payloads (events 335/336 on VM205). It must be parsed a second time.
+    meta = payload.get("metaData")
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except (TypeError, ValueError):
+            return "failed", "BLOCKING_STATE metaData is not JSON"
+    if not isinstance(meta, dict):
+        return "failed", "BLOCKING_STATE carries no usable metaData"
+
+    state = str(meta.get("stateName") or "").strip().upper()
+    if not state:
+        return "failed", "BLOCKING_STATE carries no stateName"
+
+    if state == OVERDUE_WARN_STATE:
+        return "done", (
+            "warning only (CUST_OD1_WARNING, day 7) - nothing is cut, by design"
+        )
+
+    if state in OVERDUE_BLOCK_STATES:
+        # A cut is the most damaging thing this bridge can do, so it gets the same
+        # corroboration a payment or a cancellation gets. BLOCKING_STATE arrives on
+        # the same unauthenticated callback path as everything else (Bug #153).
+        if VERIFY:
+            ok, why = killbill_verify_account_overdue(account_id)
+            if not ok:
+                return "failed", f"refusing to cut: {why}"
+        ok, msg = litellm_set_blocked(key_hash, True)
+        return (
+            ("done" if ok else "failed"),
+            f"cut-off: state={state} -> {msg}",
+        )
+
+    # Any other state is a transition back to service.
+    if VERIFY:
+        ok, why = killbill_verify_account_overdue(account_id)
+        if ok:
+            # They still owe money, so the ladder will re-block on its next pass.
+            # Report it as done rather than failed: the state will not re-emit, so
+            # retrying could never change the outcome.
+            return "done", (
+                f"state={state} but the account still has an unpaid invoice "
+                f"({why}) - declined to restore; the ladder will re-evaluate"
+            )
+    ok, msg = litellm_set_blocked(key_hash, False)
+    return (("done" if ok else "failed"), f"restore: state={state} -> {msg}")
+
+
 def process_event(conn: sqlite3.Connection, row: sqlite3.Row) -> tuple[str, str]:
     """Returns (new_status, message). new_status in {done, skipped, failed}."""
     etype = (row["event_type"] or "").upper()
@@ -1114,7 +1302,23 @@ def process_event(conn: sqlite3.Connection, row: sqlite3.Row) -> tuple[str, str]
             "payment; needs a subscription->plan lookup"
         )
 
-    if etype != ACTION_PAYMENT and etype not in ACTION_CANCEL:
+    # Phase 3 -- a failed payment is RECORDED, never acted on. Bug #154's entry is
+    # explicit that the dunning POLICY belongs to Kill Bill's overdue ladder
+    # (OD1 warn day 7 -> OD2 cut day 14 -> OD3 cancel day 30), so the bridge must
+    # not invent a second one. This event is the earliest signal we get, so it is
+    # marked done with the ladder's schedule in the reason rather than skipped --
+    # "not actionable" would hide it the way it hid three of these already.
+    if etype == ACTION_PAYMENT_FAILED:
+        return "done", (
+            "payment attempt failed (recorded; no action). The overdue ladder owns "
+            "the policy: OD1 warning day 7, OD2 cut day 14, OD3 cancel day 30"
+        )
+
+    if (
+        etype != ACTION_PAYMENT
+        and etype not in ACTION_CANCEL
+        and etype not in ACTION_BLOCK
+    ):
         return "skipped", f"not actionable: {etype or '(no eventType)'}"
 
     if not account_id:
@@ -1139,6 +1343,12 @@ def process_event(conn: sqlite3.Connection, row: sqlite3.Row) -> tuple[str, str]
             f"mapping for {account_id} has neither a litellm_key_hash nor a "
             "budget_id - nowhere to write the ceiling"
         )
+
+    # Phase 3 -- the cut-off (the hard requirement). It rides the overdue ladder's
+    # state change: the ladder owns the policy, this only reacts, so the rule lives
+    # in ONE place instead of two.
+    if etype in ACTION_BLOCK:
+        return handle_blocking_state(acct, row, account_id)
 
     if VERIFY:
         if etype == ACTION_PAYMENT:
@@ -1277,8 +1487,17 @@ def process_event(conn: sqlite3.Connection, row: sqlite3.Row) -> tuple[str, str]
                 f"{msg}; SPEND NOT RESET (no litellm_key_hash for account {account_id})"
             )
 
+        # Phase 3 -- RESTORE. A payment is the PRIMARY restore signal: it is the one
+        # that actually carries money, so it must not depend on the ladder noticing.
+        # Verified safe to call on a key that was never blocked -- /key/unblock only
+        # 404s when the key does not exist; otherwise it sets blocked=False and
+        # invalidates the cache. There is no "already unblocked" error.
+        ok3, msg3 = litellm_set_blocked(key_hash, False)
         ok2, msg2 = litellm_reset_spend(key_hash)
-        return ("done" if (ok and ok2) else "failed"), f"{msg}; {msg2}"
+        return (
+            ("done" if (ok and ok2 and ok3) else "failed"),
+            f"{msg}; {msg2}; {msg3}",
+        )
 
     # cancellation
     prow = conn.execute("SELECT * FROM plans WHERE plan_name=?", (acct["plan"],)).fetchone()
