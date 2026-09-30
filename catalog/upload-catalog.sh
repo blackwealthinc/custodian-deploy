@@ -165,10 +165,14 @@ if [ "$count" -lt 1 ]; then
   exit 1
 fi
 echo "verify     : availableBasePlans -> $count plan(s)"
+# Real response shape (verified live): keys are product / plan / priceList /
+# finalPhaseBillingPeriod / finalPhaseRecurringPrice[].value|currency.
 printf '%s' "$plans" | python3 -c "
 import sys, json
 for p in json.load(sys.stdin):
-    print('   -', p.get('name'), p.get('prices') or p.get('priceList') or '', p.get('billingPeriod') or '')
+    fp = (p.get('finalPhaseRecurringPrice') or [{}])[0]
+    price = '%s %s' % (fp.get('value', '?'), fp.get('currency', ''))
+    print('   -', p.get('plan'), p.get('finalPhaseBillingPeriod'), price)
 " 2>/dev/null || true
 
 echo "OK: $name installed with effectiveDate $effective."
