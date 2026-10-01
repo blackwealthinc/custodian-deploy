@@ -167,7 +167,10 @@ mkdir -p /opt/litellm
 
 DATABASE_URL="postgresql://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}"
 
-cat > /opt/litellm/litellm_config.yaml << EOF
+# Bug #171 fix: render to a STAGING path, never truncate the live config in place.
+# The old form (`cat > /opt/litellm/litellm_config.yaml`) silently destroyed a live
+# 6-model config (incl. custodian-video) because this heredoc defines only 5 models.
+cat > /tmp/litellm_config.new << EOF
 general_settings:
   master_key: ${LITELLM_MASTER_KEY}
   database_url: ${DATABASE_URL}
@@ -237,8 +240,55 @@ router_settings:
   retry_after: 3
 EOF
 
-chmod 600 /opt/litellm/litellm_config.yaml
-log_ok "Config written to /opt/litellm/litellm_config.yaml"
+# --- Safe replace (Bug #171 fix) -------------------------------------------------
+# Validates the staged config, refuses to DROP a model the live config serves, backs
+# up, then swaps atomically. A model removal must be an explicit decision, never a
+# side effect of re-running this installer.
+TARGET=/opt/litellm/litellm_config.yaml
+STAGE=/tmp/litellm_config.new
+
+_err() { echo "  ERROR: $*" >&2; }
+
+if [ ! -s "$STAGE" ]; then
+  _err "staged config is empty - refusing to touch $TARGET"
+  exit 1
+fi
+
+if ! python3 -c "import yaml,sys; yaml.safe_load(open(sys.argv[1]))" "$STAGE" 2>/dev/null; then
+  _err "staged config is not valid YAML - refusing to touch $TARGET"
+  exit 1
+fi
+
+if [ -f "$TARGET" ]; then
+  MISSING=$(python3 - "$TARGET" "$STAGE" <<'PY'
+import sys, yaml
+def names(p):
+    try:
+        return {m.get("model_name") for m in (yaml.safe_load(open(p)) or {}).get("model_list", [])}
+    except Exception:
+        return set()
+print(",".join(sorted(names(sys.argv[1]) - names(sys.argv[2]))))
+PY
+)
+  if [ -n "$MISSING" ]; then
+    _err "refusing to replace the live config - staged file is MISSING model(s): $MISSING"
+    _err "removing a model must be explicit; set FORCE_CONFIG_REPLACE=1 to override"
+    if [ "${FORCE_CONFIG_REPLACE:-0}" != "1" ]; then
+      exit 1
+    fi
+  fi
+  cp -a "$TARGET" "$TARGET.bak.$(date +%Y%m%d-%H%M%S)"
+  log_ok "backed up the previous config"
+fi
+
+if [ "${DRY_RUN:-0}" = "1" ]; then
+  log_ok "DRY_RUN=1 - staged config validated; live file left untouched"
+else
+  install -m 600 "$STAGE" "$TARGET"
+  chmod 600 "$TARGET"
+  log_ok "Config written to $TARGET (validated)"
+fi
+# --- end safe replace ---
 
 # Save credentials now (BEFORE container start — Bug #52 fix)
 # Previously at STEP 5, which never ran if container failed

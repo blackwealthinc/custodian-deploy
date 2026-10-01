@@ -62,6 +62,7 @@ PORT=8602 WEBUI_PORT=3002 CUSTOMER_ID=john \
 | `setup-database.sh` | Deploy PostgreSQL + schema |
 | `schema.sql` | Database tables (customers, usage, servers) |
 | `setup-budget-proxy.sh` | Deploy LiteLLM AI Gateway |
+| `setup-vm205-video.sh` | **Add the video model to an existing budget proxy — run AFTER `setup-budget-proxy.sh`** |
 | `setup-custodian-factory.sh` | Deploy Hermes + Open WebUI |
 | `docker-compose.custodian-factory.yml` | Compose file for customer servers |
 | `fix-orphan-budget-durations.sh` | Repair LiteLLM keys whose budget never resets (dry-run / `--apply` / `--clear --only`) |
