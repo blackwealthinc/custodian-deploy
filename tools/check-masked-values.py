@@ -46,6 +46,19 @@ ALLOW_FILES = {
     "custodian-bug-index.md",
 }
 
+# Bug records legitimately QUOTE the defect - that is their purpose - so they are not
+# findings. Skipped by path, so a bug log can keep describing what went wrong.
+BUG_RECORD_DIRS = {"session-logs"}
+BUG_RECORD_PREFIXES = ("bug-",)
+
+
+def is_bug_record(p: Path) -> bool:
+    if p.name in ALLOW_FILES:
+        return True
+    if any(part in BUG_RECORD_DIRS for part in p.parts):
+        return True
+    return p.name.startswith(BUG_RECORD_PREFIXES)
+
 
 def tracked_files() -> list[Path]:
     try:
@@ -60,7 +73,7 @@ def scan(paths: list[Path]) -> int:
     for p in paths:
         if not p.is_file() or p.suffix.lower() in SKIP_SUFFIX:
             continue
-        if p.name in ALLOW_FILES:
+        if is_bug_record(p):
             continue
         try:
             text = p.read_text(encoding="utf-8", errors="strict")
