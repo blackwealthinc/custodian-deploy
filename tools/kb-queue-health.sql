@@ -33,6 +33,13 @@ SELECT 'notifications.future_scheduled', COUNT(*)
  WHERE processing_state = 'AVAILABLE'
    AND effective_date >= UTC_TIMESTAMP();
 
+-- Kill Bill's third checklist item (R7): "very few payment transactions (if any)
+-- should be in an UNKNOWN state." A non-zero value is a manual-fix item via the
+-- Payment Admin API. (Bug #179.)
+SELECT 'payments.unknown', COUNT(*)
+  FROM payments
+ WHERE state_name = 'UNKNOWN';
+
 -- Business state. Drift here across a maintenance window is the signal that
 -- something ran that should not have (or did not run that should have).
 SELECT 'state.tenants', COUNT(*) FROM tenants;
