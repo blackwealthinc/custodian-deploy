@@ -67,6 +67,8 @@ PORT=8602 WEBUI_PORT=3002 CUSTOMER_ID=john \
 | `docker-compose.custodian-factory.yml` | Compose file for customer servers |
 | `fix-orphan-budget-durations.sh` | Repair LiteLLM keys whose budget never resets (dry-run / `--apply` / `--clear --only`) |
 | `verify-budget-reset.sh` | Prove the LiteLLM budget-reset job actually fires (~10 min, disposable key) |
+| `tools/kb-regression.py` | Kill Bill business-level regression harness — `snapshot` before a window, `diff` after, to judge the change against a baseline instead of hope |
+| `tools/kb-queue-health.sql` | Read-only query for the two metrics Kill Bill's deployment guide names as the canary (`bus_events` empty, no past-due `AVAILABLE` notifications). Feed its output to `kb-regression.py --db-counts-file` |
 
 ## Docs
 
