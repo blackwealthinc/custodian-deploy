@@ -70,8 +70,8 @@ LITELLM_PORT="${LITELLM_PORT:-443}"
 LITELLM_MASTER_KEY="sk-$(openssl rand -hex 32)"
 LITELLM_SALT_KEY=$(openssl rand -hex 32)
 _LMK_VN="LITELLM_MASTER""_KEY"  # indirection pattern (Bug #52 fix, DANGER ZONE #11)
-_DSK_VN="DASHSCOPE_""_API_KEY"  # indirection pattern (DANGER ZONE #11)
-_OAI_VN="OPENAI_""_API_KEY"     # indirection pattern — image generation
+_DSK_VN="DASHSCOPE_""API_KEY"  # indirection pattern (DANGER ZONE #11)
+_OAI_VN="OPENAI_""API_KEY"     # indirection pattern — image generation
 ADMIN_EMAIL="${ADMIN_EMAIL:-admin@custodian.app}"
 
 # ── Database credentials ──
