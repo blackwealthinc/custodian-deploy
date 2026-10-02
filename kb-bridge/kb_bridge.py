@@ -148,6 +148,14 @@ MAX_ATTEMPTS = int(cfg("KB_MAX_ATTEMPTS", "8"))
 HTTP_TIMEOUT = float(cfg("KB_HTTP_TIMEOUT", "20"))
 SWEEP_INTERVAL_SECONDS = float(cfg("KB_SWEEP_INTERVAL_SECONDS", "900"))
 
+# Dunning notice (domain-email-and-go-to-market-strategy.md §2.8): the bridge
+# sends the overdue warning itself -- one HTTP call to Resend. Best-effort: a
+# missing key means "skip the email, never crash", and the cut-off (OD2/OD3) is
+# independent of the notice. Emails go to RESELLERS only (the account's email).
+RESEND_API_KEY = cfg("KB_RESEND_API_KEY", "")
+RESEND_FROM = cfg("KB_RESEND_FROM", "Custodian Billing <invoices@billing.custodian.work>")
+RESEND_SUBJECT = cfg("KB_RESEND_SUBJECT", "Action needed: your Custodian payment is overdue")
+
 # --- worker lease (Bug #150) ----------------------------------------------- #
 # Claiming a row is "borrowing it for a fixed period", never permanent ownership.
 # If the worker dies between the claim and the status update (SIGKILL, OOM kill
@@ -757,6 +765,67 @@ def killbill_configured() -> bool:
     return bool(KILLBILL_URL and KB_API_KEY and KB_API_SECRET and KB_USER and KB_PASSWORD)
 
 
+def killbill_account_email(account_id: str) -> tuple[bool, str, str]:
+    """Fetch a reseller account's email from Kill Bill. Returns (ok, email, why).
+
+    §2.8: dunning notices go to RESELLERS only, and the account carries the
+    address (`email` + `locale`). The bridge's own `accounts` table has no email
+    column, so this is fetched on demand rather than stored.
+    """
+    if not killbill_configured():
+        return False, "", "Kill Bill is not configured"
+    url = f"{KILLBILL_URL}/1.0/kb/accounts/{account_id}"
+    status, data, _ = http_json_hdrs("GET", url, None, killbill_headers())
+    if status != 200:
+        return False, "", f"GET account -> {status}"
+    email = ""
+    if isinstance(data, dict):
+        email = (data.get("email") or "").strip()
+    if not email:
+        return False, "", f"account {account_id} has no email"
+    return True, email, ""
+
+
+def send_dunning_email(to_email: str, subject: str, body_html: str) -> tuple[bool, str]:
+    """Send one dunning notice via the Resend API. Returns (ok, message).
+
+    Best-effort by design: the caller decides whether to retry. Never raises --
+    a bad key, a timeout, or a 4xx/5xx is returned as (False, why) so the worker
+    can log it and keep the queue moving.
+    """
+    if not RESEND_API_KEY:
+        return False, "KB_RESEND_API_KEY is not configured"
+    payload = json.dumps(
+        {"from": RESEND_FROM, "to": [to_email], "subject": subject, "html": body_html}
+    ).encode()
+    req = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=payload,
+        method="POST",
+        headers={
+            "Authorization": "Bearer " + RESEND_API_KEY,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            # api.resend.com sits behind Cloudflare; urllib's default UA is
+            # 403-blocked ("error code: 1010"). A real UA is required.
+            "User-Agent": "Custodian-kb-bridge/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+            mid = ""
+            try:
+                mid = json.loads(raw).get("id", "")
+            except Exception:  # noqa: BLE001 - body may not be JSON
+                mid = ""
+            return True, ("resend 200" + (f" id={mid}" if mid else ""))
+    except urllib.error.HTTPError as exc:
+        return False, f"resend HTTP {exc.code}"
+    except Exception as exc:  # noqa: BLE001 - timeout/conn refused are all "not sent"
+        return False, f"resend error: {exc}"
+
+
 def killbill_verify_invoice_paid(account_id: str, invoice_id: str) -> tuple[bool, str]:
     """Re-verify a claimed payment against Kill Bill. Fail closed.
 
@@ -1294,8 +1363,27 @@ def handle_blocking_state(
         return "failed", "BLOCKING_STATE carries no stateName"
 
     if state == OVERDUE_WARN_STATE:
-        return "done", (
-            "warning only (CUST_OD1_WARNING, day 7) - nothing is cut, by design"
+        # §2.8: the bridge sends the warning email itself (one Resend HTTP call).
+        # The email is the whole point of OD1 -- but it is still a NOTICE, not
+        # enforcement. A missing address is "done" (nothing to send; retrying
+        # cannot conjure one), while a send failure is "failed" (retry with
+        # backoff so the notice still reaches the reseller). The cut-off
+        # (OD2/OD3) is independent and unaffected by either path.
+        ok_email, email, why_email = killbill_account_email(account_id)
+        if not ok_email:
+            return "done", (
+                f"warning (CUST_OD1_WARNING) but {why_email} - no dunning email sent"
+            )
+        body = (
+            "<p>Your payment for your Custodian reseller licence is overdue.</p>"
+            "<p>If payment is not received, your services will be paused. "
+            "Please update your payment method or contact support.</p>"
+        )
+        ok, msg = send_dunning_email(email, RESEND_SUBJECT, body)
+        if ok:
+            return "done", f"warning (CUST_OD1_WARNING): dunning email sent to {email}"
+        return "failed", (
+            f"warning (CUST_OD1_WARNING): dunning email to {email} NOT sent ({msg})"
         )
 
     if state in OVERDUE_BLOCK_STATES:

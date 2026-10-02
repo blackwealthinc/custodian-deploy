@@ -73,13 +73,18 @@ def check(name, got, want):
         print("        want: %r" % (want,))
 
 
-def with_stubs(payload, key_hash=KEY_HASH, verify=(True, "verified: 1 unpaid")):
-    """Run handle_blocking_state with block/verify intercepted."""
+def with_stubs(payload, key_hash=KEY_HASH, verify=(True, "verified: 1 unpaid"),
+               email=(True, "reseller@example.com", ""), send=(True, "resend 200")):
+    """Run handle_blocking_state with block/verify/email intercepted."""
     calls = []
     orig_block = B.litellm_set_blocked
     orig_verify = B.killbill_verify_account_overdue
+    orig_email = B.killbill_account_email
+    orig_send = B.send_dunning_email
     B.litellm_set_blocked = lambda ref, blocked: (calls.append((ref, blocked)), (True, "stub ok"))[1]
     B.killbill_verify_account_overdue = lambda a: verify
+    B.killbill_account_email = lambda a: email
+    B.send_dunning_email = lambda to, subj, body: send
     try:
         acct = {"litellm_key_hash": key_hash}
         row = {"payload": json.dumps(payload)}
@@ -87,16 +92,28 @@ def with_stubs(payload, key_hash=KEY_HASH, verify=(True, "verified: 1 unpaid")):
     finally:
         B.litellm_set_blocked = orig_block
         B.killbill_verify_account_overdue = orig_verify
+        B.killbill_account_email = orig_email
+        B.send_dunning_email = orig_send
 
 
 print("Phase 3 cut-off — real-payload tests")
 print()
 
-# 1. day-7 warning must NOT cut anything
+# 1. day-7 warning must NOT cut anything, and must send the dunning notice
 (status, msg), calls = with_stubs(REAL_BLOCKING_WARN)
 check("OD1 warning -> status done", status, "done")
 check("OD1 warning -> NOTHING cut (no block call)", calls, [])
-check("OD1 warning -> reason says so", "nothing is cut" in msg, True)
+check("OD1 warning -> dunning email sent", "dunning email sent" in msg, True)
+
+# 1b. email send failure -> retry (failed), still no cut
+(status, msg), calls = with_stubs(REAL_BLOCKING_WARN, send=(False, "resend HTTP 500"))
+check("OD1 + email send fails -> failed (retry)", status, "failed")
+check("OD1 + email send fails -> still no cut", calls, [])
+
+# 1c. no account email -> done (nothing to send), still no cut
+(status, msg), calls = with_stubs(REAL_BLOCKING_WARN, email=(False, "", "account has no email"))
+check("OD1 + no email -> done (nothing to send)", status, "done")
+check("OD1 + no email -> reason says so", "no dunning email sent" in msg, True)
 
 # 2. day-14 blocking state MUST cut, and must cut THE KEY
 (status, msg), calls = with_stubs(BLOCKED)
