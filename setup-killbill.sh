@@ -207,6 +207,7 @@ services:
       KILLBILL_DAO_USER: root
       KILLBILL_DAO_PASSWORD: ${DB_PASSWORD}
       JAVA_OPTS: ${JAVA_HEAP}
+      KB_org_killbill_payment_retry_days: "4,4,4"
 
   kaui:
     image: killbill/kaui:${KAUI_VERSION}
