@@ -74,7 +74,7 @@ def check(name, got, want):
 
 
 def with_stubs(payload, key_hash=KEY_HASH, verify=(True, "verified: 1 unpaid"),
-               email=(True, "reseller@example.com", ""), send=(True, "resend 200")):
+               email=(True, "reseller@example.com", "", False), send=(True, "resend 200")):
     """Run handle_blocking_state with block/verify/email intercepted."""
     calls = []
     orig_block = B.litellm_set_blocked
@@ -84,7 +84,7 @@ def with_stubs(payload, key_hash=KEY_HASH, verify=(True, "verified: 1 unpaid"),
     B.litellm_set_blocked = lambda ref, blocked: (calls.append((ref, blocked)), (True, "stub ok"))[1]
     B.killbill_verify_account_overdue = lambda a: verify
     B.killbill_account_email = lambda a: email
-    B.send_dunning_email = lambda to, subj, body: send
+    B.send_dunning_email = lambda to, subj, body, idempotency_key="": send
     try:
         acct = {"litellm_key_hash": key_hash}
         row = {"payload": json.dumps(payload)}
@@ -111,9 +111,15 @@ check("OD1 + email send fails -> failed (retry)", status, "failed")
 check("OD1 + email send fails -> still no cut", calls, [])
 
 # 1c. no account email -> done (nothing to send), still no cut
-(status, msg), calls = with_stubs(REAL_BLOCKING_WARN, email=(False, "", "account has no email"))
+(status, msg), calls = with_stubs(REAL_BLOCKING_WARN, email=(False, "", "account has no email", False))
 check("OD1 + no email -> done (nothing to send)", status, "done")
 check("OD1 + no email -> reason says so", "no dunning email sent" in msg, True)
+
+# 1d. transient fetch error -> retry (failed), still no cut
+(status, msg), calls = with_stubs(REAL_BLOCKING_WARN, email=(False, "", "GET account -> 500", True))
+check("OD1 + fetch error -> failed (retry)", status, "failed")
+check("OD1 + fetch error -> still no cut", calls, [])
+check("OD1 + fetch error -> reason says will retry", "will retry" in msg, True)
 
 # 2. day-14 blocking state MUST cut, and must cut THE KEY
 (status, msg), calls = with_stubs(BLOCKED)
@@ -211,6 +217,35 @@ bad_a = {"eventType": "BLOCKING_STATE", "objectType": "ACCOUNT",
 bad_b = dict(bad_a, metaData="also not json")
 check("#166 unidentifiable transitions -> DIFFERENT keys",
       B.idem_key_of(bad_a, b"aaa") != B.idem_key_of(bad_b, b"bbb"), True)
+
+# --- Fix #2: send_dunning_email passes Idempotency-Key through to the request --
+_captured = {}
+
+
+def _fake_urlopen(req, timeout=None):
+    for k, v in (req.headers or {}).items():
+        if str(k).lower() == "idempotency-key":
+            _captured["idem"] = v
+
+    class _Resp:
+        status = 200
+        def read(self): return b'{"id":"test-id"}'
+        def __enter__(self): return self
+        def __exit__(self, *a, **k): return False
+    return _Resp()
+
+
+_orig_key = B.RESEND_API_KEY
+_orig_urlopen = B.urllib.request.urlopen
+B.RESEND_API_KEY = "test-key"
+B.urllib.request.urlopen = _fake_urlopen
+try:
+    ok, _msg = B.send_dunning_email("x@y.com", "s", "<p>b</p>", idempotency_key="od1-test-123")
+finally:
+    B.RESEND_API_KEY = _orig_key
+    B.urllib.request.urlopen = _orig_urlopen
+check("send_dunning_email -> ok with key", ok, True)
+check("Idempotency-Key header set", _captured.get("idem"), "od1-test-123")
 
 print()
 print("%d/%d passed" % (sum(results), len(results)))

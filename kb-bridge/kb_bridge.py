@@ -765,51 +765,66 @@ def killbill_configured() -> bool:
     return bool(KILLBILL_URL and KB_API_KEY and KB_API_SECRET and KB_USER and KB_PASSWORD)
 
 
-def killbill_account_email(account_id: str) -> tuple[bool, str, str]:
-    """Fetch a reseller account's email from Kill Bill. Returns (ok, email, why).
+def killbill_account_email(account_id: str) -> tuple[bool, str, str, bool]:
+    """Fetch a reseller account's email from Kill Bill. Returns (ok, email, why, retryable).
 
     §2.8: dunning notices go to RESELLERS only, and the account carries the
     address (`email` + `locale`). The bridge's own `accounts` table has no email
     column, so this is fetched on demand rather than stored.
+
+    `retryable` distinguishes a TRANSIENT fetch failure (Kill Bill hiccup /
+    replication lag) -- worth retrying -- from a PERMANENT one (no email / not
+    configured) -- retrying cannot conjure an address.
     """
     if not killbill_configured():
-        return False, "", "Kill Bill is not configured"
+        return False, "", "Kill Bill is not configured", False
     url = f"{KILLBILL_URL}/1.0/kb/accounts/{account_id}"
     status, data, _ = http_json_hdrs("GET", url, None, killbill_headers())
     if status != 200:
-        return False, "", f"GET account -> {status}"
+        # Kill Bill just emitted an event for this account, so a non-200 here is
+        # a transient inconsistency (hiccup / replication lag), not a permanent
+        # state. Worth retrying.
+        return False, "", f"GET account -> {status}", True
     email = ""
     if isinstance(data, dict):
         email = (data.get("email") or "").strip()
     if not email:
-        return False, "", f"account {account_id} has no email"
-    return True, email, ""
+        return False, "", f"account {account_id} has no email", False
+    return True, email, "", False
 
 
-def send_dunning_email(to_email: str, subject: str, body_html: str) -> tuple[bool, str]:
+def send_dunning_email(to_email: str, subject: str, body_html: str,
+                       idempotency_key: str = "") -> tuple[bool, str]:
     """Send one dunning notice via the Resend API. Returns (ok, message).
 
     Best-effort by design: the caller decides whether to retry. Never raises --
     a bad key, a timeout, or a 4xx/5xx is returned as (False, why) so the worker
     can log it and keep the queue moving.
+
+    `idempotency_key` is passed through as Resend's `Idempotency-Key` header:
+    a retry of the same logical notice (same key) is deduped by Resend within
+    24h, so a timeout that actually delivered won't re-send a duplicate.
     """
     if not RESEND_API_KEY:
         return False, "KB_RESEND_API_KEY is not configured"
     payload = json.dumps(
         {"from": RESEND_FROM, "to": [to_email], "subject": subject, "html": body_html}
     ).encode()
+    hdrs = {
+        "Authorization": "Bearer " + RESEND_API_KEY,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        # api.resend.com sits behind Cloudflare; urllib's default UA is
+        # 403-blocked ("error code: 1010"). A real UA is required.
+        "User-Agent": "Custodian-kb-bridge/1.0",
+    }
+    if idempotency_key:
+        hdrs["Idempotency-Key"] = idempotency_key
     req = urllib.request.Request(
         "https://api.resend.com/emails",
         data=payload,
         method="POST",
-        headers={
-            "Authorization": "Bearer " + RESEND_API_KEY,
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            # api.resend.com sits behind Cloudflare; urllib's default UA is
-            # 403-blocked ("error code: 1010"). A real UA is required.
-            "User-Agent": "Custodian-kb-bridge/1.0",
-        },
+        headers=hdrs,
     )
     try:
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
@@ -1369,8 +1384,12 @@ def handle_blocking_state(
         # cannot conjure one), while a send failure is "failed" (retry with
         # backoff so the notice still reaches the reseller). The cut-off
         # (OD2/OD3) is independent and unaffected by either path.
-        ok_email, email, why_email = killbill_account_email(account_id)
+        ok_email, email, why_email, retryable = killbill_account_email(account_id)
         if not ok_email:
+            if retryable:
+                return "failed", (
+                    f"warning (CUST_OD1_WARNING) but {why_email} - will retry"
+                )
             return "done", (
                 f"warning (CUST_OD1_WARNING) but {why_email} - no dunning email sent"
             )
@@ -1379,7 +1398,8 @@ def handle_blocking_state(
             "<p>If payment is not received, your services will be paused. "
             "Please update your payment method or contact support.</p>"
         )
-        ok, msg = send_dunning_email(email, RESEND_SUBJECT, body)
+        idem = f"od1-{account_id}-{meta.get('effectiveDate') or ''}"
+        ok, msg = send_dunning_email(email, RESEND_SUBJECT, body, idempotency_key=idem)
         if ok:
             return "done", f"warning (CUST_OD1_WARNING): dunning email sent to {email}"
         return "failed", (
