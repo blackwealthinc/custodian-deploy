@@ -208,6 +208,7 @@ services:
       KILLBILL_DAO_PASSWORD: ${DB_PASSWORD}
       JAVA_OPTS: ${JAVA_HEAP}
       KB_org_killbill_payment_retry_days: "4,4,4"
+      KB_org_killbill_invoice_emailNotificationsEnabled: "true"
 
   kaui:
     image: killbill/kaui:${KAUI_VERSION}
