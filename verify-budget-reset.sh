@@ -149,7 +149,7 @@ echo
 echo "============================================================================"
 if [ "$PROVEN" = "yes" ]; then
     echo " RESULT: PASS — the budget-reset job is live and clears spend."
-    echo " Budgets with budget_duration=1mo will reset on the 1st of each month."
+    echo " Budgets with budget_duration=31d reset every 31 days (rolling); 1mo/30d reset on the 1st."
 else
     echo " RESULT: INCONCLUSIVE — no tick seen within ${SELFTEST_MAX_WAIT}s."
     echo " Check the container is running and disable_reset_budget is not set:"

@@ -93,15 +93,15 @@ and `spend` cannot be reset when the customer pays — the event says
 `SPEND NOT RESET (no litellm_key_hash …)` rather than failing quietly.
 
 **`--budget-id` is OPTIONAL and normally omitted.** `setup-custodian-factory.sh` provisions
-keys that carry their own `max_budget` and `budget_duration: 1mo` and are linked to **no
+keys that carry their own `max_budget` and `budget_duration: 31d` and are linked to **no
 budget object at all**:
 
 ```
-max_budget: 5.0     budget_duration: 1mo     budget_id: None     litellm_budget_table: None
+max_budget: 5.0     budget_duration: 31d     budget_id: None     litellm_budget_table: None
 ```
 
-Such a key is fully supported: the ceiling is written on the **key** and it resets monthly
-via `reset_budget_for_litellm_keys()` (keyed on the key's own `budget_reset_at`). The
+Such a key is fully supported: the ceiling is written on the **key** and it resets every
+31 days (rolling) via `reset_budget_for_litellm_keys()` (keyed on the key's own `budget_reset_at`). The
 budget object is only the legacy fallback for an account with **no** key hash. Do not
 "repair" a missing budget object.
 
@@ -412,7 +412,7 @@ because `NONE` is already the default.
 | `KB_PATH_TOKEN` | generated | the secret in the URL path |
 | `KB_LITELLM_URL` | `http://127.0.0.1:4000` | co-located |
 | `KB_LITELLM_MASTER_KEY` | — | **must start with `sk-`** |
-| `KB_BUDGET_DURATION` | *(empty)* | e.g. `1mo` for a monthly reset |
+| `KB_BUDGET_DURATION` | *(empty)* | e.g. `31d` for a rolling ~monthly reset |
 | `KB_KILLBILL_URL` | *(empty)* | set to enable verification + sweep |
 | `KB_KILLBILL_API_KEY` / `_API_SECRET` | *(empty)* | per-tenant Kill Bill credentials |
 | `KB_KILLBILL_USER` / `_PASSWORD` | *(empty)* | basic auth for the REST API |
@@ -544,6 +544,6 @@ so a repeat cut cannot collide with the first one either.
    this mapping — the operator step is the documented path (no write-capable HTTP surface until
    Contabo automation lands).
 4. **Firewall `:8555`.** *(done — `kb-bridge-firewall.service`, REJECT not DROP)*
-5. ~~Decide `KB_BUDGET_DURATION`~~ — **`1mo`** (== `30d`; both snap to the 1st).
+5. ~~Decide `KB_BUDGET_DURATION`~~ — **`31d`** rolling (`1mo` == `30d`; both snap to the 1st).
 6. **Add the per-tenant credential model** before onboarding a second reseller.
-7. **Align the two period clocks** (subscription start day = the 1st) before charging anyone.
+7. ~~Align the two period clocks to the 1st~~ — **superseded** (rolling `31d` replaces calendar-1st alignment).

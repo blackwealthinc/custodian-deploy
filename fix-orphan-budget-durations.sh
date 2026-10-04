@@ -16,7 +16,7 @@
 #   key_management_endpoints.py:1925-1935  /key/update writes budget_duration AND budget_reset_at
 #   key_management_endpoints.py:942-946    keys linked to a budget inherit its schedule
 #   litellm/proxy/utils.py:5299            _hash_token_if_needed accepts a stored sha256 hash
-#   duration_parser.py                     "1mo" snaps to the 1st of the month ("30d" is equivalent)
+#   duration_parser.py                     "1mo"/"30d" snap to the 1st; "31d" is rolling
 #   constants.py:1467,1477                 reset job interval = 597-605 s (PROXY_BUDGET_RESCHEDULER_*)
 #
 # Run ON the budget-proxy box (VM205) as root:
@@ -28,7 +28,7 @@
 #                           --clear, so a revert can never touch unrelated live keys.
 #
 # Environment variables:
-#   KB_BUDGET_DURATION   duration to apply (default: 1mo — calendar-monthly, resets on the 1st)
+#   KB_BUDGET_DURATION   duration to apply (default: 31d — rolling ~monthly; 1mo/30d snap to the 1st)
 #   LITELLM_URL          LiteLLM base URL (default: http://127.0.0.1:4000)
 #   LITELLM_MASTER_KEY   master key (default: auto-detected from the bridge env / litellm yaml)
 #   PG_CONTAINER/PG_DB/PG_USER  defaults: custodian-postgres / custodian / custodian
@@ -39,7 +39,7 @@
 set -euo pipefail
 
 LITELLM_URL="${LITELLM_URL:-http://127.0.0.1:4000}"
-DURATION="${KB_BUDGET_DURATION:-1mo}"
+DURATION="${KB_BUDGET_DURATION:-31d}"
 
 PG_CONTAINER="${PG_CONTAINER:-custodian-postgres}"
 PG_DB="${PG_DB:-custodian}"

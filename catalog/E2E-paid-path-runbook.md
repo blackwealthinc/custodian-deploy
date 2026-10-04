@@ -121,6 +121,7 @@ already handled and deduped it via the shared idempotency key. Only one
 
 ## Note on `KB_BUDGET_DURATION`
 
-It is currently **blank**, so no monthly reset occurs and the budget is a hard
-one-time ceiling. Setting it (e.g. `30d`) makes LiteLLM reset the ceiling each
-period — that is the "monthly allowance" behaviour and is still an open decision.
+**DECIDED 2026-10-04: `31d`** — rolling ~monthly. `1mo`/`30d` both snap to the 1st (calendar),
+so `31d` is the correct rolling value. The bridge env is set to `31d` and `setup-custodian-factory.sh`
+provisions keys with `budget_duration: 31d`. (Note: the *primary* reset is payment-driven — the bridge
+clears spend on `INVOICE_PAYMENT_SUCCESS`; `budget_duration` is the demo/backstop/reconcile trigger.)
