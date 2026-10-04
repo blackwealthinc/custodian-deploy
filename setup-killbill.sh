@@ -174,6 +174,27 @@ fi
 # ============================================================
 log_step "Step 4: Docker Compose File"
 
+# IDEMPOTENCY GUARD (Bug #185): NEVER clobber an existing compose.
+# The live compose may carry hardening this template does not reproduce (e.g. #159's scoped
+# `killbill`/`kaui` DB users). Overwriting it would silently REVERT that hardening and desync the
+# DB password (`.db-credentials` vs the live MariaDB volume). Regenerate only if the operator
+# deliberately deletes the file.
+if [ -f "$KILLBILL_BASE/docker-compose.yml" ]; then
+    COMPOSE_BACKUP="$KILLBILL_BASE/docker-compose.yml.bak-$(date +%Y%m%d-%H%M%S)"
+    cp -a "$KILLBILL_BASE/docker-compose.yml" "$COMPOSE_BACKUP"
+    log_warn "Existing compose found — KEEPING it (backup: $COMPOSE_BACKUP)."
+    log_warn "Re-run will NOT overwrite it (Bug #185 guard). To regenerate, delete it first."
+    COMPOSE_PRESENT=true
+else
+    COMPOSE_PRESENT=false
+fi
+
+if [ "$COMPOSE_PRESENT" = false ]; then
+# NOTE (Bug #185 follow-up): this template still emits `KILLBILL_DAO_USER: root` /
+# `KAUI_CONFIG_DAO_USER: root`. The ACTIVE live box uses scoped `killbill`/`kaui` users (#159).
+# Making a FRESH install scoped-by-default (init SQL + scoped DAO users) is a separate change that
+# MUST be rehearsed before shipping — do not ship it untested. Until then, the guard above is what
+# protects existing boxes from a silent revert.
 cat > "$KILLBILL_BASE/docker-compose.yml" << COMPOSE_EOF
 services:
   db:
@@ -230,6 +251,7 @@ COMPOSE_EOF
 
 chmod 600 "$KILLBILL_BASE/docker-compose.yml"
 log_ok "Compose file written to $KILLBILL_BASE/docker-compose.yml"
+fi   # end COMPOSE_PRESENT guard (Bug #185)
 
 # ============================================================
 # STEP 5: Start the stack
